@@ -820,7 +820,7 @@ async function renderOverview() {
     dayListEl.innerHTML = `<div class="empty-state">Inga trades importerade än. Gå till <strong>Importera</strong> för att ladda upp din Avanza-historik.</div>`;
     document.getElementById('heatmapGrid').innerHTML = '';
     document.getElementById('heatmapMonthLabel').textContent = '';
-    renderAchievements();
+    await renderAchievements();
     return;
   }
 
@@ -830,7 +830,10 @@ async function renderOverview() {
 
   await renderGlobalStatsRow();
   await renderHeatmap();
-  renderAchievements();
+  // Måste awaitas (bugg tidigare): annars kan denna panel visa fördröjda/inaktuella siffror från
+  // föregående månad ett ögonblick eftersom IndexedDB-läsningen inuti renderAchievements() är
+  // asynkron och inget annat väntade in den.
+  await renderAchievements();
 
   dayListEl.innerHTML = dates.map(date => {
     const dayTrades = byDate[date];
@@ -2050,17 +2053,17 @@ function openQuickImportModal() {
 }
 
 function setupHeatmapNav() {
-  document.getElementById('heatmapPrev').addEventListener('click', () => {
+  document.getElementById('heatmapPrev').addEventListener('click', async () => {
     heatmapCursor.setMonth(heatmapCursor.getMonth() - 1);
-    renderHeatmap();
-    renderGlobalStatsRow();
-    renderAchievements();
+    await renderHeatmap();
+    await renderGlobalStatsRow();
+    await renderAchievements();
   });
-  document.getElementById('heatmapNext').addEventListener('click', () => {
+  document.getElementById('heatmapNext').addEventListener('click', async () => {
     heatmapCursor.setMonth(heatmapCursor.getMonth() + 1);
-    renderHeatmap();
-    renderGlobalStatsRow();
-    renderAchievements();
+    await renderHeatmap();
+    await renderGlobalStatsRow();
+    await renderAchievements();
   });
   document.getElementById('heatmapMetricFinalBtn').addEventListener('click', () => {
     heatmapMetric = 'final';
