@@ -303,22 +303,26 @@ main#app {
 /* ---------- Heatmap ---------- */
 .heatmap-nav { display: flex; align-items: center; gap: 10px; }
 .heatmap-month-label { font-weight: 700; min-width: 140px; text-align: center; }
-.heatmap-week-figure {
-  display: inline-flex; align-items: baseline; gap: 6px;
-  font-size: 0.82rem; color: var(--text-muted);
-}
-.heatmap-week-figure .val { font-weight: 700; font-size: 0.95rem; font-variant-numeric: tabular-nums; }
-.heatmap-week-figure .val.pos { color: var(--green); }
-.heatmap-week-figure .val.neg { color: var(--red); }
 .heatmap-grid {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(5, 1fr) 0.85fr;
   gap: 6px;
 }
 .heatmap-dow {
   text-align: center; font-size: 0.7rem; color: var(--text-muted);
   text-transform: uppercase; padding-bottom: 4px;
 }
+.heatmap-dow.heatmap-week-col-label { color: var(--text); font-weight: 700; }
+.heatmap-cell.heatmap-week-total {
+  background: var(--bg-panel);
+  border-style: dashed;
+  cursor: default;
+  font-weight: 700;
+  color: var(--text-muted);
+}
+.heatmap-cell.heatmap-week-total.pos { color: var(--green); border-color: rgba(var(--green-rgb), 0.4); }
+.heatmap-cell.heatmap-week-total.neg { color: var(--red); border-color: rgba(var(--red-rgb), 0.4); }
+.heatmap-cell.heatmap-week-total .dnum { color: inherit; opacity: 0.85; font-weight: 700; }
 .heatmap-cell {
   aspect-ratio: 1 / 1;
   border-radius: 6px;

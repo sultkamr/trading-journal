@@ -526,6 +526,18 @@ function sumMetricForRange(byDate, start, end, metric) {
   return sum;
 }
 
+/* Veckonummer enligt ISO 8601 (samma system som används i Sverige: måndag som veckostart,
+   vecka 1 = veckan som innehåller årets första torsdag). */
+function isoWeekNumber(d) {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (date.getUTCDay() + 6) % 7; // Mån=0 .. Sön=6
+  date.setUTCDate(date.getUTCDate() - dayNum + 3); // torsdag i denna vecka
+  const firstThursday = new Date(Date.UTC(date.getUTCFullYear(), 0, 4));
+  const firstThursdayDayNum = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - firstThursdayDayNum + 3);
+  return 1 + Math.round((date - firstThursday) / (7 * 24 * 60 * 60 * 1000));
+}
+
 /*
  * Rendrar bara toppens stat-rad (vecka/månad/totalt + handelsdagar/trades/träffsäkerhet).
  * Egen funktion så att kalenderns Slutresultat/Dagens topp-toggle kan uppdatera siffrorna utan
@@ -544,17 +556,32 @@ async function renderGlobalStatsRow() {
   trades.forEach(t => { if (t.result !== null && t.result !== undefined) { if (t.result > 0) wins++; else if (t.result < 0) losses++; } });
   const winRate = (wins + losses) > 0 ? (wins / (wins + losses) * 100) : null;
 
+  // "Denna månad" följer alltid den månad som är vald i kalendern nedan (heatmapCursor) – inte
+  // datorns verkliga dagens datum – så siffran matchar det du faktiskt bläddrat fram till och inte
+  // visar 0 kr bara för att du tittar på en annan månad än den du råkar sitta i just nu.
+  const cursorMonth = heatmapCursor || new Date();
+  const monthRange = getMonthRange(cursorMonth);
+  const monthLabelText = cursorMonth.toLocaleDateString('sv-SE', { month: 'long', year: 'numeric' });
+  const monthLabel = monthLabelText.charAt(0).toUpperCase() + monthLabelText.slice(1);
+
+  // "Denna vecka" visar den riktiga aktuella veckan (baserat på systemets datum) när du tittar på
+  // den månad du faktiskt befinner dig i just nu. Bläddrar du till en annan månad visas istället den
+  // månadens sista vecka, så veckonumret alltid syftar på en vecka som verkligen finns i vyn nedan –
+  // samma veckonummer och summa som står i kalenderns egen veckokolumn.
   const now = new Date();
-  const weekRange = getWeekRange(now);
-  const monthRange = getMonthRange(now);
+  const isViewingCurrentMonth = now.getFullYear() === cursorMonth.getFullYear() && now.getMonth() === cursorMonth.getMonth();
+  const weekRefDate = isViewingCurrentMonth ? now : new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() + 1, 0);
+  const weekRange = getWeekRange(weekRefDate);
+  const weekLabel = 'Vecka ' + isoWeekNumber(weekRefDate);
+
   const weekSum = sumMetricForRange(byDate, weekRange.start, weekRange.end, heatmapMetric);
   const monthSum = sumMetricForRange(byDate, monthRange.start, monthRange.end, heatmapMetric);
   const totalSum = sumMetricForRange(byDate, new Date(0), new Date(8640000000000000), heatmapMetric);
   const metricSuffix = heatmapMetric === 'peak' ? ' (dagens topp)' : '';
 
   globalStatsEl.innerHTML =
-    statBox('Denna vecka' + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
-    statBox('Denna månad' + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
+    statBox(weekLabel + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
+    statBox(monthLabel + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
     statBox('Totalt resultat' + metricSuffix, formatMoney(totalSum), totalSum >= 0 ? 'pos' : 'neg', totalSum) +
     statBox('Handelsdagar', dates.length) +
     statBox('Totalt antal trades', trades.length) +
@@ -581,7 +608,7 @@ async function renderOverview() {
   const dates = Object.keys(byDate).sort().reverse();
 
   await renderGlobalStatsRow();
-  renderHeatmap();
+  await renderHeatmap();
   renderAchievements();
 
   dayListEl.innerHTML = dates.map(date => {
@@ -663,7 +690,12 @@ function computeTradeGroupsForDay(trades) {
   });
 }
 
-function renderTradeGroups(groups, baseMovePct, tolerancePct) {
+/*
+ * `journalByTradeId`: valfri karta { tradeId -> [journalEntry, ...] } (byggs av anroparen från
+ * dagens journalanteckningar). Om en trades ben har en kopplad anteckning med bilder, visas de som
+ * thumbnails direkt på tradekortet – så man faktiskt "ser traden" utan att behöva gå via Journal-fliken.
+ */
+function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) {
   if (groups.length === 0) return '<div class="empty-state">Inga transaktioner att gruppera.</div>';
   const baseMove = baseMovePct === undefined || baseMovePct === null ? RULE_DEFAULT_THRESHOLDS.max_risk_pct_leveraged : baseMovePct;
   return groups.map((g, gi) => {
@@ -705,6 +737,16 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct) {
       }
     }
 
+    // Bilder kopplade till någon av positionens ben (via journalanteckningar med tradeId satt).
+    const linkedEntries = journalByTradeId
+      ? g.legs.flatMap(t => journalByTradeId[t.id] || [])
+      : [];
+    const images = linkedEntries.flatMap(e => e.images || []);
+    const imagesHtml = images.length ? `
+      <div class="entry-images" style="margin-top:10px;">
+        ${images.map(src => `<img src="${src}" alt="Bild för Trade ${gi + 1}">`).join('')}
+      </div>` : '';
+
     return `
     <div class="entry-card">
       <div class="entry-card-head">
@@ -723,7 +765,8 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct) {
         <thead><tr><th>Del</th><th>Antal</th><th>Kurs</th><th>Resultat</th></tr></thead>
         <tbody>${exitRows}</tbody>
       </table>` : ''}
-      <div style="margin-top:10px;"><button class="btn btn-ghost btn-small group-journal-btn" data-trade-id="${lastLeg.id}">+ Journal för denna trade</button></div>
+      ${imagesHtml}
+      <div style="margin-top:10px;"><button class="btn btn-ghost btn-small group-journal-btn" data-trade-id="${lastLeg.id}">${images.length ? '+ Fler bilder/anteckning för Trade ' + (gi + 1) : '+ Bild/anteckning för Trade ' + (gi + 1)}</button></div>
     </div>`;
   }).join('');
 }
@@ -839,6 +882,10 @@ async function openDayInfoModal(date) {
   const ascTrades = dayTrades.slice().sort((a, b) => a.fileOrder - b.fileOrder);
   const groups = computeTradeGroupsForDay(ascTrades);
 
+  const journalEntries = await dbGetAllByIndex('journal', 'date', date);
+  const journalByTradeId = {};
+  journalEntries.forEach(e => { if (e.tradeId) (journalByTradeId[e.tradeId] = journalByTradeId[e.tradeId] || []).push(e); });
+
   const modalHtml = `
     <h2>${formatDateHuman(date)}</h2>
     <div class="stat-row">
@@ -850,14 +897,14 @@ async function openDayInfoModal(date) {
     <p class="muted small" style="line-height:1.5;">${statusDotHtml(insight.tone)}${escapeHtml(insight.text)}</p>
     <div style="max-height: 420px; overflow-y: auto;">
       ${groups.length > 0 ? `
-        <p class="muted small" style="margin-bottom:6px;">Dagens trades, ihopparade (entry + ev. TP1/TP2/TP3... vid delvisa uttag). Avanzas export har inget klockslag, bara datum och radordning.</p>
-        <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct)}</div>
+        <p class="muted small" style="margin-bottom:6px;">Dagens trades, ihopparade (entry + ev. TP1/TP2/TP3... vid delvisa uttag). Klicka "+ Bild/anteckning" på ett tradekort för att koppla en skärmdump till just den traden. Avanzas export har inget klockslag, bara datum och radordning.</p>
+        <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct, journalByTradeId)}</div>
       ` : ''}
       ${stats.tradeCount > 0 ? `<p class="muted small" style="margin:16px 0 0;">Alla transaktioner denna dag, rå ordning:</p>${renderCompactTradeTable(stats)}` : ''}
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="dayInfoClose">Stäng</button>
-      <button class="btn btn-secondary" id="dayInfoAddJournal" style="margin-top:0;">+ Journal/bild för dagen</button>
+      <button class="btn btn-secondary" id="dayInfoAddJournal" style="margin-top:0;">+ Journal/bild för dagen (utan specifik trade)</button>
       <button class="btn btn-primary" id="dayInfoOpenDetail">Öppna dagsdetalj →</button>
     </div>
   `;
@@ -865,12 +912,12 @@ async function openDayInfoModal(date) {
   document.getElementById('dayInfoClose').addEventListener('click', closeModal);
   document.getElementById('dayInfoAddJournal').addEventListener('click', () => {
     closeModal();
-    openJournalForm(null, { date });
+    openJournalForm(null, { date }, () => openDayInfoModal(date));
   });
   document.querySelectorAll('#modal .group-journal-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       closeModal();
-      openJournalForm(null, { date, tradeId: parseInt(btn.dataset.tradeId, 10) });
+      openJournalForm(null, { date, tradeId: parseInt(btn.dataset.tradeId, 10) }, () => openDayInfoModal(date));
     });
   });
   document.getElementById('dayInfoOpenDetail').addEventListener('click', async () => {
@@ -983,8 +1030,15 @@ async function openDayDetail(date, reversed, viewMode) {
       <tbody>${tableRows}</tbody>
     </table>
   `;
+  // Bilder kopplade till en specifik trade (inte bara dagen som helhet) ska synas direkt på
+  // tradekortet här också, inte bara i kalenderns info-popup.
+  const journalEntriesForDay = await dbGetAllByIndex('journal', 'date', date);
+  const journalByTradeId = {};
+  journalEntriesForDay.forEach(e => {
+    if (e.tradeId) (journalByTradeId[e.tradeId] = journalByTradeId[e.tradeId] || []).push(e);
+  });
   const groupedHtml = `
-    <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct)}</div>
+    <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct, journalByTradeId)}</div>
   `;
 
   document.getElementById('dayDetailContent').innerHTML = `
@@ -1011,7 +1065,7 @@ async function openDayDetail(date, reversed, viewMode) {
   document.getElementById('viewModeFlatBtn').addEventListener('click', () => openDayDetail(date, reversed, 'flat'));
   document.getElementById('viewModeGroupedBtn').addEventListener('click', () => openDayDetail(date, reversed, 'grouped'));
   document.querySelectorAll('.group-journal-btn').forEach(btn => {
-    btn.addEventListener('click', () => openJournalForm(null, { date, tradeId: parseInt(btn.dataset.tradeId, 10) }));
+    btn.addEventListener('click', () => openJournalForm(null, { date, tradeId: parseInt(btn.dataset.tradeId, 10) }, () => openDayDetail(date, reversed, viewMode)));
   });
 
   document.getElementById('reverseOrderBtn').addEventListener('click', () => { if (viewMode !== 'grouped') openDayDetail(date, !reversed, viewMode); });
@@ -1116,7 +1170,12 @@ async function renderJournalList() {
   });
 }
 
-async function openJournalForm(existing, prefill) {
+/*
+ * Öppnar journalformuläret (inkl. bilduppladdning). `onDone`, om satt, körs efter att en anteckning
+ * sparats eller tagits bort – t.ex. för att stänga tillbaka till kalenderns infopopup istället för
+ * att bara lämna användaren på Journal-fliken, så att en nyss tillagd bild syns direkt på tradekortet.
+ */
+async function openJournalForm(existing, prefill, onDone) {
   const isEdit = !!existing;
   const entry = existing || {
     date: (prefill && prefill.date) || todayISO(),
@@ -1169,6 +1228,7 @@ async function openJournalForm(existing, prefill) {
       if (confirm('Ta bort anteckningen?')) {
         await dbDelete('journal', entry.id);
         closeModal(); renderJournalList(); showToast('Anteckning borttagen');
+        if (typeof onDone === 'function') onDone();
       }
     });
   }
@@ -1184,6 +1244,7 @@ async function openJournalForm(existing, prefill) {
     const payload = { date, tradeId, title, outcome, text, images, createdAt: entry.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
     if (isEdit) { payload.id = entry.id; await dbPut('journal', payload); } else { await dbAdd('journal', payload); }
     closeModal(); renderJournalList(); showToast('Sparat');
+    if (typeof onDone === 'function') onDone();
   });
 }
 
@@ -1648,35 +1709,55 @@ async function renderHeatmap() {
   const daysInMonth = new Date(year, month + 1, 0).getDate();
 
   // Guld-/BULL-BEAR-certifikat handlas inte på helger, så kalendern visar bara Mån-Fre (5 kolumner) –
-  // lördag och söndag tas bort helt istället för att visas som tomma/gråa rutor varje vecka.
-  const dowLabels = ['MÅN', 'TIS', 'ONS', 'TOR', 'FRE'];
-  let html = dowLabels.map(d => `<div class="heatmap-dow">${d}</div>`).join('');
+  // lördag och söndag tas bort helt. En 6:e kolumn läggs till per veckorad med det ISO-veckonummer
+  // (samma system som svensk kalender använder) och veckans summa, så resultatet alltid syns bredvid
+  // rätt vecka i själva matrisen istället för i en lös ruta som kan syfta på fel period.
+  const dowLabels = ['MÅN', 'TIS', 'ONS', 'TOR', 'FRE', 'VECKA'];
+  let html = dowLabels.map(d => `<div class="heatmap-dow${d === 'VECKA' ? ' heatmap-week-col-label' : ''}">${d}</div>`).join('');
 
-  let firstWeekdayRendered = false;
-  for (let day = 1; day <= daysInMonth; day++) {
-    const weekdayIndex = (new Date(year, month, day).getDay() + 6) % 7; // Mån=0 .. Sön=6
-    if (weekdayIndex >= 5) continue; // hoppa över lördag/söndag helt (ingen ruta alls)
-    if (!firstWeekdayRendered) {
-      for (let i = 0; i < weekdayIndex; i++) html += '<div class="heatmap-cell"></div>';
-      firstWeekdayRendered = true;
-    }
-    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-    const dayTrades = byDate[dateStr];
-    let cls = 'heatmap-cell';
-    let pnlLabel = '';
-    if (dayTrades && dayTrades.length) {
-      const val = metricValue(dateStr);
-      const intensity = Math.min(4, Math.max(1, Math.ceil((Math.abs(val) / maxAbs) * 4)));
-      cls += val >= 0 ? ` has-trades win-${intensity}` : ` has-trades loss-${intensity}`;
-      const stats = statsByDate[dateStr];
-      const overtradeMark = stats.giveback > 0.01 ? '<span title="Gav tillbaka från toppen">↩</span>' : '';
-      pnlLabel = `<div class="dpnl">${val >= 0 ? '+' : ''}${Math.round(val)} ${overtradeMark}</div>`;
-      if (rules.length) {
-        const compliance = evaluateDayCompliance(dayTrades, rules);
-        if (!compliance.compliant) cls += ' rule-flag';
+  const monthStart = new Date(year, month, 1);
+  const monthEnd = new Date(year, month, daysInMonth);
+  const rowStart = new Date(monthStart);
+  rowStart.setDate(monthStart.getDate() - ((monthStart.getDay() + 6) % 7)); // måndagen i den första veckan
+  const rowEnd = new Date(monthEnd);
+  rowEnd.setDate(monthEnd.getDate() + (4 - ((monthEnd.getDay() + 6) % 7))); // fredagen i den sista veckan
+
+  const cursor = new Date(rowStart);
+  while (cursor <= rowEnd) {
+    let weekSum = 0;
+    let weekHasData = false;
+    let rowHtml = '';
+    for (let i = 0; i < 5; i++) {
+      const d = new Date(cursor);
+      d.setDate(cursor.getDate() + i);
+      const inMonth = d.getMonth() === month;
+      if (!inMonth) { rowHtml += '<div class="heatmap-cell"></div>'; continue; }
+      const day = d.getDate();
+      const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const dayTrades = byDate[dateStr];
+      let cls = 'heatmap-cell';
+      let pnlLabel = '';
+      if (dayTrades && dayTrades.length) {
+        const val = metricValue(dateStr);
+        weekSum += val;
+        weekHasData = true;
+        const intensity = Math.min(4, Math.max(1, Math.ceil((Math.abs(val) / maxAbs) * 4)));
+        cls += val >= 0 ? ` has-trades win-${intensity}` : ` has-trades loss-${intensity}`;
+        const stats = statsByDate[dateStr];
+        const overtradeMark = stats.giveback > 0.01 ? '<span title="Gav tillbaka från toppen">↩</span>' : '';
+        pnlLabel = `<div class="dpnl">${val >= 0 ? '+' : ''}${Math.round(val)} ${overtradeMark}</div>`;
+        if (rules.length) {
+          const compliance = evaluateDayCompliance(dayTrades, rules);
+          if (!compliance.compliant) cls += ' rule-flag';
+        }
       }
+      rowHtml += `<div class="${cls}" data-date="${dateStr}"><div class="dnum">${day}</div>${pnlLabel}</div>`;
     }
-    html += `<div class="${cls}" data-date="${dateStr}"><div class="dnum">${day}</div>${pnlLabel}</div>`;
+    const weekNo = isoWeekNumber(cursor);
+    const weekCls = 'heatmap-cell heatmap-week-total' + (weekHasData ? (weekSum >= 0 ? ' pos' : ' neg') : '');
+    rowHtml += `<div class="${weekCls}"><div class="dnum">V.${weekNo}</div>${weekHasData ? `<div class="dpnl">${weekSum >= 0 ? '+' : ''}${Math.round(weekSum)}</div>` : ''}</div>`;
+    html += rowHtml;
+    cursor.setDate(cursor.getDate() + 7);
   }
 
   const grid = document.getElementById('heatmapGrid');
@@ -1684,17 +1765,6 @@ async function renderHeatmap() {
   grid.querySelectorAll('.heatmap-cell.has-trades').forEach(cell => {
     cell.addEventListener('click', () => openDayInfoModal(cell.dataset.date));
   });
-
-  // Veckans resultat, visad direkt i Kalender-kortet, byter mellan slutresultat/dagens topp
-  // beroende på samma toggle som styr rutornas färg – en enda källa till sanning istället för
-  // två separata switchar på sidan.
-  const weekFigureEl = document.getElementById('heatmapWeekFigure');
-  if (weekFigureEl) {
-    const wr = getWeekRange(new Date());
-    const weekSum = sumMetricForRange(byDate, wr.start, wr.end, heatmapMetric);
-    const label = heatmapMetric === 'peak' ? 'Veckans bästa punkter' : 'Veckans resultat';
-    weekFigureEl.innerHTML = `${escapeHtml(label)}: <span class="val ${weekSum >= 0 ? 'pos' : 'neg'}">${formatMoney(weekSum)}</span>`;
-  }
 }
 
 function setupHeatmapNav() {
