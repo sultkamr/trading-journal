@@ -11,17 +11,23 @@
 
 <header class="topbar">
   <div class="brand">
-    <span class="brand-mark">◆</span>
+    <span class="brand-mark">TJ</span>
     <span class="brand-name">Trading Journal</span>
   </div>
-  <nav class="tabs" id="mainTabs">
-    <button class="tab-btn active" data-view="overview">Översikt</button>
-    <button class="tab-btn" data-view="import">Importera</button>
-    <button class="tab-btn" data-view="journal">Journal</button>
-    <button class="tab-btn" data-view="education">Utbildning</button>
-    <button class="tab-btn" data-view="goldbias">Guldbias</button>
-    <button class="tab-btn" data-view="rules">Regler</button>
-  </nav>
+  <div class="topbar-right">
+    <nav class="tabs" id="mainTabs">
+      <button class="tab-btn active" data-view="overview">Översikt</button>
+      <button class="tab-btn" data-view="import">Importera</button>
+      <button class="tab-btn" data-view="journal">Journal</button>
+      <button class="tab-btn" data-view="education">Utbildning</button>
+      <button class="tab-btn" data-view="goldbias">Guldbias</button>
+      <button class="tab-btn" data-view="rules">Regler</button>
+    </nav>
+    <div class="theme-toggle" id="themeToggle">
+      <button id="themeDarkBtn" class="active">Mörkt</button>
+      <button id="themeLightBtn">Ljust</button>
+    </div>
+  </div>
 </header>
 
 <main id="app">
@@ -31,11 +37,6 @@
     <div class="view-header">
       <h1>Översikt</h1>
       <p class="muted">Alla importerade handelsdagar. Klicka på en dag för att se detaljer, trade-sekvens och resultatkurva.</p>
-    </div>
-    <div class="filter-row" id="overviewMetricToggle" style="margin-bottom:10px;">
-      <span class="muted small" style="align-self:center;">Basera vecka/månad/totalt på:</span>
-      <button class="btn btn-small btn-primary" id="overviewMetricFinalBtn" style="margin-top:0;">Slutresultat</button>
-      <button class="btn btn-small btn-secondary" id="overviewMetricPeakBtn" style="margin-top:0;">Dagens topp</button>
     </div>
     <div class="stat-row" id="globalStats"></div>
 
@@ -56,10 +57,11 @@
           <button class="btn btn-ghost btn-small" id="heatmapNext">›</button>
         </div>
       </div>
-      <div class="filter-row" style="margin-bottom:10px;">
-        <span class="muted small" style="align-self:center;">Visa i rutorna:</span>
+      <div class="filter-row" style="margin-bottom:10px; align-items:center;">
+        <span class="muted small" style="align-self:center;">Visa i rutorna (styr även vecka/månad/totalt nedan):</span>
         <button class="btn btn-small btn-primary" id="heatmapMetricFinalBtn" style="margin-top:0;">Slutresultat</button>
         <button class="btn btn-small btn-secondary" id="heatmapMetricPeakBtn" style="margin-top:0;">Dagens topp</button>
+        <span class="heatmap-week-figure" id="heatmapWeekFigure" style="margin-left:auto;"></span>
       </div>
       <div id="heatmapGrid" class="heatmap-grid"></div>
       <div class="heatmap-legend">

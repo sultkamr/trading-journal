@@ -499,9 +499,6 @@ function setupImport() {
 /* ---------- Overview / Dashboard ---------- */
 let equityChartInstance = null;
 
-// 'final' = summera varje dags slutresultat, 'peak' = summera varje dags bästa (topp) punkt istället.
-let overviewMetric = 'final';
-
 /* Måndag 00:00 – söndag 23:59:59 för veckan som innehåller `d`. */
 function getWeekRange(d) {
   const date = new Date(d); date.setHours(0, 0, 0, 0);
@@ -529,14 +526,49 @@ function sumMetricForRange(byDate, start, end, metric) {
   return sum;
 }
 
-async function renderOverview() {
+/*
+ * Rendrar bara toppens stat-rad (vecka/månad/totalt + handelsdagar/trades/träffsäkerhet).
+ * Egen funktion så att kalenderns Slutresultat/Dagens topp-toggle kan uppdatera siffrorna utan
+ * att (som en full renderOverview() skulle göra) döljas en redan öppen dagsdetalj under tiden.
+ */
+async function renderGlobalStatsRow() {
   const trades = await dbGetAll('trades');
   const globalStatsEl = document.getElementById('globalStats');
+  if (trades.length === 0) { globalStatsEl.innerHTML = ''; return; }
+
+  const byDate = {};
+  trades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
+  const dates = Object.keys(byDate);
+
+  let wins = 0, losses = 0;
+  trades.forEach(t => { if (t.result !== null && t.result !== undefined) { if (t.result > 0) wins++; else if (t.result < 0) losses++; } });
+  const winRate = (wins + losses) > 0 ? (wins / (wins + losses) * 100) : null;
+
+  const now = new Date();
+  const weekRange = getWeekRange(now);
+  const monthRange = getMonthRange(now);
+  const weekSum = sumMetricForRange(byDate, weekRange.start, weekRange.end, heatmapMetric);
+  const monthSum = sumMetricForRange(byDate, monthRange.start, monthRange.end, heatmapMetric);
+  const totalSum = sumMetricForRange(byDate, new Date(0), new Date(8640000000000000), heatmapMetric);
+  const metricSuffix = heatmapMetric === 'peak' ? ' (dagens topp)' : '';
+
+  globalStatsEl.innerHTML =
+    statBox('Denna vecka' + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
+    statBox('Denna månad' + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
+    statBox('Totalt resultat' + metricSuffix, formatMoney(totalSum), totalSum >= 0 ? 'pos' : 'neg', totalSum) +
+    statBox('Handelsdagar', dates.length) +
+    statBox('Totalt antal trades', trades.length) +
+    statBox('Träffsäkerhet', winRate !== null ? winRate.toFixed(0) + '%' : '–');
+  runStatAnimations(globalStatsEl);
+}
+
+async function renderOverview() {
+  const trades = await dbGetAll('trades');
   const dayListEl = document.getElementById('dayList');
   document.getElementById('dayDetailCard').classList.add('hidden');
 
   if (trades.length === 0) {
-    globalStatsEl.innerHTML = '';
+    document.getElementById('globalStats').innerHTML = '';
     dayListEl.innerHTML = `<div class="empty-state">Inga trades importerade än. Gå till <strong>Importera</strong> för att ladda upp din Avanza-historik.</div>`;
     document.getElementById('heatmapGrid').innerHTML = '';
     document.getElementById('heatmapMonthLabel').textContent = '';
@@ -548,27 +580,7 @@ async function renderOverview() {
   trades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
   const dates = Object.keys(byDate).sort().reverse();
 
-  let totalPnl = 0, wins = 0, losses = 0;
-  trades.forEach(t => { if (t.result !== null && t.result !== undefined) { totalPnl += t.result; if (t.result > 0) wins++; else if (t.result < 0) losses++; } });
-  const winRate = (wins + losses) > 0 ? (wins / (wins + losses) * 100) : null;
-
-  const now = new Date();
-  const weekRange = getWeekRange(now);
-  const monthRange = getMonthRange(now);
-  const weekSum = sumMetricForRange(byDate, weekRange.start, weekRange.end, overviewMetric);
-  const monthSum = sumMetricForRange(byDate, monthRange.start, monthRange.end, overviewMetric);
-  const totalSum = sumMetricForRange(byDate, new Date(0), new Date(8640000000000000), overviewMetric);
-  const metricSuffix = overviewMetric === 'peak' ? ' (dagens topp)' : '';
-
-  globalStatsEl.innerHTML =
-    statBox('Denna vecka' + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
-    statBox('Denna månad' + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
-    statBox('Totalt resultat' + metricSuffix, formatMoney(totalSum), totalSum >= 0 ? 'pos' : 'neg', totalSum) +
-    statBox('Handelsdagar', dates.length) +
-    statBox('Totalt antal trades', trades.length) +
-    statBox('Träffsäkerhet', winRate !== null ? winRate.toFixed(0) + '%' : '–');
-  runStatAnimations(globalStatsEl);
-
+  await renderGlobalStatsRow();
   renderHeatmap();
   renderAchievements();
 
@@ -784,7 +796,13 @@ function statusDotHtml(tone) { return `<span class="status-dot ${toneDotClass(to
 // Behåller det gamla namnet som en tunn wrapper (kalendermodal/dagsdetalj kan fortsätta be om ren text).
 function overtradingVerdictText(stats) { return dayInsight(stats).text; }
 
-/* Kompakt transaktionstabell (alla dagens trades) med dagens toppunkt markerad – används i info-popupen. */
+/*
+ * Kompakt transaktionstabell (alla dagens trades) med dagens toppunkt markerad – används i info-popupen.
+ * Visar Antal/Kurs/Belopp per rad (inte bara Resultat) så att flera "Köp"-rader på samma instrument
+ * går att skilja åt – de är normalt inte dubbletter utan att man skalat in positionen i flera steg,
+ * ofta till olika kurser/antal. Köp-rader saknar alltid Resultat eftersom vinst/förlust bara
+ * realiseras när man säljer.
+ */
 function renderCompactTradeTable(stats) {
   const rows = stats.sorted.map((t, i) => {
     const isPeak = stats.giveback > 0.01 && stats.peakTrade && t === stats.peakTrade;
@@ -793,15 +811,19 @@ function renderCompactTradeTable(stats) {
       <td>${i + 1}</td>
       <td class="${t.type === 'Köp' ? 'tag-buy' : 'tag-sell'}">${escapeHtml(t.type)}</td>
       <td>${escapeHtml(t.instrument)}</td>
+      <td>${formatNum(t.quantity, 0)}</td>
+      <td>${formatNum(t.price, 4)}</td>
+      <td>${t.amount != null ? formatMoney(t.amount) : ''}</td>
       <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
       <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeak ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;"><span class="status-dot ok" style="margin-right:5px;"></span>Hit borde du stannat</span>' : ''}</td>
     </tr>`;
   }).join('');
   return `
     <table class="trade-table" style="margin-top:14px;">
-      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Resultat</th><th>Löpande</th></tr></thead>
+      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Antal</th><th>Kurs</th><th>Belopp</th><th>Resultat</th><th>Löpande</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
+    <p class="muted small" style="margin-top:8px; line-height:1.5;">Flera "Köp"-rader på samma certifikat är normalt inte dubbletter – de visar att positionen byggdes upp i flera steg (ofta till olika kurs/antal, se kolumnerna Antal/Kurs/Belopp). Köp-rader saknar alltid Resultat eftersom vinst/förlust bara uppstår vid Sälj. För dagens första transaktion är Resultat och Löpande alltid samma summa, eftersom det löpande resultatet bara är den enda tradens resultat så länge inget annat hänt än dagen.</p>
   `;
 }
 
@@ -835,11 +857,16 @@ async function openDayInfoModal(date) {
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="dayInfoClose">Stäng</button>
+      <button class="btn btn-secondary" id="dayInfoAddJournal" style="margin-top:0;">+ Journal/bild för dagen</button>
       <button class="btn btn-primary" id="dayInfoOpenDetail">Öppna dagsdetalj →</button>
     </div>
   `;
   openModal(modalHtml);
   document.getElementById('dayInfoClose').addEventListener('click', closeModal);
+  document.getElementById('dayInfoAddJournal').addEventListener('click', () => {
+    closeModal();
+    openJournalForm(null, { date });
+  });
   document.querySelectorAll('#modal .group-journal-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       closeModal();
@@ -1618,15 +1645,21 @@ async function renderHeatmap() {
 
   const maxAbs = Object.keys(statsByDate).reduce((max, d) => Math.max(max, Math.abs(metricValue(d))), 0) || 1;
 
-  const firstOfMonth = new Date(year, month, 1);
-  const startOffset = (firstOfMonth.getDay() + 6) % 7; // Monday = 0
   const daysInMonth = new Date(year, month + 1, 0).getDate();
 
-  const dowLabels = ['MÅN', 'TIS', 'ONS', 'TOR', 'FRE', 'LÖR', 'SÖN'];
+  // Guld-/BULL-BEAR-certifikat handlas inte på helger, så kalendern visar bara Mån-Fre (5 kolumner) –
+  // lördag och söndag tas bort helt istället för att visas som tomma/gråa rutor varje vecka.
+  const dowLabels = ['MÅN', 'TIS', 'ONS', 'TOR', 'FRE'];
   let html = dowLabels.map(d => `<div class="heatmap-dow">${d}</div>`).join('');
-  for (let i = 0; i < startOffset; i++) html += '<div class="heatmap-cell"></div>';
 
+  let firstWeekdayRendered = false;
   for (let day = 1; day <= daysInMonth; day++) {
+    const weekdayIndex = (new Date(year, month, day).getDay() + 6) % 7; // Mån=0 .. Sön=6
+    if (weekdayIndex >= 5) continue; // hoppa över lördag/söndag helt (ingen ruta alls)
+    if (!firstWeekdayRendered) {
+      for (let i = 0; i < weekdayIndex; i++) html += '<div class="heatmap-cell"></div>';
+      firstWeekdayRendered = true;
+    }
     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
     const dayTrades = byDate[dateStr];
     let cls = 'heatmap-cell';
@@ -1651,6 +1684,17 @@ async function renderHeatmap() {
   grid.querySelectorAll('.heatmap-cell.has-trades').forEach(cell => {
     cell.addEventListener('click', () => openDayInfoModal(cell.dataset.date));
   });
+
+  // Veckans resultat, visad direkt i Kalender-kortet, byter mellan slutresultat/dagens topp
+  // beroende på samma toggle som styr rutornas färg – en enda källa till sanning istället för
+  // två separata switchar på sidan.
+  const weekFigureEl = document.getElementById('heatmapWeekFigure');
+  if (weekFigureEl) {
+    const wr = getWeekRange(new Date());
+    const weekSum = sumMetricForRange(byDate, wr.start, wr.end, heatmapMetric);
+    const label = heatmapMetric === 'peak' ? 'Veckans bästa punkter' : 'Veckans resultat';
+    weekFigureEl.innerHTML = `${escapeHtml(label)}: <span class="val ${weekSum >= 0 ? 'pos' : 'neg'}">${formatMoney(weekSum)}</span>`;
+  }
 }
 
 function setupHeatmapNav() {
@@ -1666,28 +1710,17 @@ function setupHeatmapNav() {
     heatmapMetric = 'final';
     document.getElementById('heatmapMetricFinalBtn').className = 'btn btn-small btn-primary';
     document.getElementById('heatmapMetricPeakBtn').className = 'btn btn-small btn-secondary';
+    // Uppdaterar kalendern + vecka/månad/totalt-rutorna, men INTE via full renderOverview() –
+    // den skulle döljt en redan öppen dagsdetalj som en bieffekt.
     renderHeatmap();
+    renderGlobalStatsRow();
   });
   document.getElementById('heatmapMetricPeakBtn').addEventListener('click', () => {
     heatmapMetric = 'peak';
     document.getElementById('heatmapMetricPeakBtn').className = 'btn btn-small btn-primary';
     document.getElementById('heatmapMetricFinalBtn').className = 'btn btn-small btn-secondary';
     renderHeatmap();
-  });
-}
-
-function setupOverviewMetricToggle() {
-  document.getElementById('overviewMetricFinalBtn').addEventListener('click', () => {
-    overviewMetric = 'final';
-    document.getElementById('overviewMetricFinalBtn').className = 'btn btn-small btn-primary';
-    document.getElementById('overviewMetricPeakBtn').className = 'btn btn-small btn-secondary';
-    renderOverview();
-  });
-  document.getElementById('overviewMetricPeakBtn').addEventListener('click', () => {
-    overviewMetric = 'peak';
-    document.getElementById('overviewMetricPeakBtn').className = 'btn btn-small btn-primary';
-    document.getElementById('overviewMetricFinalBtn').className = 'btn btn-small btn-secondary';
-    renderOverview();
+    renderGlobalStatsRow();
   });
 }
 
@@ -1821,10 +1854,35 @@ function setupGlobalUI() {
   document.getElementById('biasFilter').addEventListener('change', renderBiasList);
 
   setupHeatmapNav();
-  setupOverviewMetricToggle();
+}
+
+/* ---------- Tema: ljust / mörkt läge ---------- */
+const THEME_STORAGE_KEY = 'tj_theme';
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  const darkBtn = document.getElementById('themeDarkBtn');
+  const lightBtn = document.getElementById('themeLightBtn');
+  if (darkBtn && lightBtn) {
+    darkBtn.classList.toggle('active', theme === 'dark');
+    lightBtn.classList.toggle('active', theme === 'light');
+  }
+}
+function getStoredTheme() {
+  try { return localStorage.getItem(THEME_STORAGE_KEY); } catch (e) { return null; }
+}
+function setStoredTheme(theme) {
+  try { localStorage.setItem(THEME_STORAGE_KEY, theme); } catch (e) { /* privat läge etc. – strunta i det */ }
+}
+function setupThemeToggle() {
+  const stored = getStoredTheme();
+  const prefersLight = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-color-scheme: light)').matches;
+  applyTheme(stored || (prefersLight ? 'light' : 'dark'));
+  document.getElementById('themeDarkBtn').addEventListener('click', () => { applyTheme('dark'); setStoredTheme('dark'); });
+  document.getElementById('themeLightBtn').addEventListener('click', () => { applyTheme('light'); setStoredTheme('light'); });
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  setupThemeToggle();
   try {
     await openDB();
   } catch (err) {
