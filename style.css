@@ -242,7 +242,21 @@ main#app {
   background: var(--gradient-accent); -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .streak-banner .streak-figure .lbl { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 4px; }
-.streak-banner .streak-icon { font-size: 1.8rem; filter: drop-shadow(0 0 10px rgba(111,123,255,0.6)); }
+.streak-banner .streak-icon {
+  display: inline-block;
+  width: 34px; height: 34px;
+  border-radius: 50%;
+  background: var(--gradient-accent);
+  box-shadow: 0 0 14px rgba(111,123,255,0.6);
+  position: relative;
+  flex-shrink: 0;
+}
+.streak-banner .streak-icon::before {
+  content: '';
+  position: absolute; inset: 8px;
+  border-radius: 50%;
+  background: var(--bg-elevated);
+}
 
 .badge-shelf { display: flex; flex-wrap: wrap; gap: 10px; }
 .badge {
@@ -257,7 +271,22 @@ main#app {
   opacity: 0.5;
   transition: opacity 0.2s, transform 0.15s, box-shadow 0.2s;
 }
-.badge .icon { font-size: 1rem; }
+.badge .icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: -0.3px;
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+.badge.unlocked .icon {
+  background: var(--gradient-accent);
+  color: #0b0e1a;
+  border-color: transparent;
+}
 .badge.unlocked {
   opacity: 1;
   color: var(--text);
@@ -349,6 +378,30 @@ main#app {
   background: var(--red-soft); color: var(--red); border: 1px solid rgba(255,93,120,0.3);
 }
 .rule-chip.ok { background: var(--green-soft); color: var(--green); border-color: rgba(43,230,160,0.3); }
+
+/* CSS-ritade statusindikatorer (ersätter emojis i UI-texter) */
+.status-dot {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  margin-right: 7px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+.status-dot.warn { background: var(--red); box-shadow: 0 0 7px rgba(255,93,120,0.65); }
+.status-dot.info { background: var(--accent); box-shadow: 0 0 7px rgba(111,123,255,0.55); }
+.status-dot.ok { background: var(--green); box-shadow: 0 0 7px rgba(43,230,160,0.55); }
+.status-dot.neutral { background: var(--text-muted); box-shadow: none; }
+
+.status-flag {
+  display: inline-block;
+  width: 12px; height: 12px;
+  margin-right: 6px;
+  vertical-align: middle;
+  flex-shrink: 0;
+  background: var(--yellow);
+  clip-path: polygon(0 0, 100% 20%, 0 40%, 0 100%, 20% 100%, 20% 0);
+}
 
 .empty-state {
   text-align: center;

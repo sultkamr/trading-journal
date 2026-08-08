@@ -460,7 +460,7 @@ async function renderImportHistory() {
     <div class="entry-card">
       <div class="entry-card-head">
         <div>
-          <div class="entry-card-title">${escapeHtml(rangeLabel)} ${isDup ? '<span class="rule-chip" style="margin-left:6px;">⚠ Möjlig dubblett</span>' : ''}</div>
+          <div class="entry-card-title">${escapeHtml(rangeLabel)} ${isDup ? '<span class="rule-chip" style="margin-left:6px;"><span class="status-dot warn" style="margin-right:5px;"></span>Möjlig dubblett</span>' : ''}</div>
           <div class="entry-card-meta">${escapeHtml(b.filename)} · Importerad ${new Date(b.importedAt).toLocaleString('sv-SE')}</div>
         </div>
         <div class="entry-card-actions"><button class="btn btn-danger btn-small delete-batch" data-id="${b.id}">Ta bort</button></div>
@@ -499,6 +499,36 @@ function setupImport() {
 /* ---------- Overview / Dashboard ---------- */
 let equityChartInstance = null;
 
+// 'final' = summera varje dags slutresultat, 'peak' = summera varje dags bästa (topp) punkt istället.
+let overviewMetric = 'final';
+
+/* Måndag 00:00 – söndag 23:59:59 för veckan som innehåller `d`. */
+function getWeekRange(d) {
+  const date = new Date(d); date.setHours(0, 0, 0, 0);
+  const dow = (date.getDay() + 6) % 7; // Mån=0 .. Sön=6
+  const start = new Date(date); start.setDate(date.getDate() - dow);
+  const end = new Date(start); end.setDate(start.getDate() + 6); end.setHours(23, 59, 59, 999);
+  return { start, end };
+}
+/* Hela kalendermånaden som innehåller `d`. */
+function getMonthRange(d) {
+  const date = new Date(d);
+  const start = new Date(date.getFullYear(), date.getMonth(), 1);
+  const end = new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
+  return { start, end };
+}
+/* Summerar antingen slutresultat eller dagens topp (beroende på metric) för dagar inom [start, end]. */
+function sumMetricForRange(byDate, start, end, metric) {
+  let sum = 0;
+  Object.keys(byDate).forEach(date => {
+    const d = new Date(date + 'T00:00:00');
+    if (d < start || d > end) return;
+    const stats = computeDayStats(byDate[date]);
+    sum += metric === 'peak' ? stats.peak : stats.totalPnl;
+  });
+  return sum;
+}
+
 async function renderOverview() {
   const trades = await dbGetAll('trades');
   const globalStatsEl = document.getElementById('globalStats');
@@ -522,8 +552,18 @@ async function renderOverview() {
   trades.forEach(t => { if (t.result !== null && t.result !== undefined) { totalPnl += t.result; if (t.result > 0) wins++; else if (t.result < 0) losses++; } });
   const winRate = (wins + losses) > 0 ? (wins / (wins + losses) * 100) : null;
 
+  const now = new Date();
+  const weekRange = getWeekRange(now);
+  const monthRange = getMonthRange(now);
+  const weekSum = sumMetricForRange(byDate, weekRange.start, weekRange.end, overviewMetric);
+  const monthSum = sumMetricForRange(byDate, monthRange.start, monthRange.end, overviewMetric);
+  const totalSum = sumMetricForRange(byDate, new Date(0), new Date(8640000000000000), overviewMetric);
+  const metricSuffix = overviewMetric === 'peak' ? ' (dagens topp)' : '';
+
   globalStatsEl.innerHTML =
-    statBox('Totalt resultat', formatMoney(totalPnl), totalPnl >= 0 ? 'pos' : 'neg', totalPnl) +
+    statBox('Denna vecka' + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
+    statBox('Denna månad' + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
+    statBox('Totalt resultat' + metricSuffix, formatMoney(totalSum), totalSum >= 0 ? 'pos' : 'neg', totalSum) +
     statBox('Handelsdagar', dates.length) +
     statBox('Totalt antal trades', trades.length) +
     statBox('Träffsäkerhet', winRate !== null ? winRate.toFixed(0) + '%' : '–');
@@ -614,7 +654,7 @@ function computeTradeGroupsForDay(trades) {
 function renderTradeGroups(groups, baseMovePct, tolerancePct) {
   if (groups.length === 0) return '<div class="empty-state">Inga transaktioner att gruppera.</div>';
   const baseMove = baseMovePct === undefined || baseMovePct === null ? RULE_DEFAULT_THRESHOLDS.max_risk_pct_leveraged : baseMovePct;
-  return groups.map(g => {
+  return groups.map((g, gi) => {
     const statusLabel = g.status === 'open' ? 'Öppen vid dagens slut' : g.openedBeforeVisibleData ? 'Position öppnad innan denna dag' : 'Stängd';
     const statusClass = g.status === 'open' ? 'neutral' : g.totalResult > 0 ? 'pos' : g.totalResult < 0 ? 'neg' : 'neutral';
     const exitRows = g.exitLegs.map((t, i) => `
@@ -627,22 +667,29 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct) {
     `).join('');
     const lastLeg = g.legs[g.legs.length - 1];
 
-    // Risk per position: hela positionens förlust (alla exit-ben ihopräknade) mot vad som satsades in (entryCost).
+    // Resultat/risk per position i % av köpt belopp – visas alltid (vinst eller förlust), inte bara
+    // när risken sprack. Vid förlust jämförs den mot riskbudgeten (~2,4% × hävstång) och flaggas om
+    // den överskreds; vid vinst visas bara resultatet i %.
     let riskHtml = '';
-    if (g.totalResult < 0 && g.entryCost > 0) {
+    if (g.entryCost > 0) {
       const leverage = parseLeverage(g.instrument);
-      const lossPct = (-g.totalResult / g.entryCost) * 100;
-      if (leverage) {
-        const allowedPct = baseMove * leverage;
-        const tol = tolerancePct === undefined || tolerancePct === null ? RULE_DEFAULT_TOLERANCE_PCT : tolerancePct;
-        const bufferedAllowedPct = allowedPct * (1 + tol / 100);
-        const exceeded = lossPct > bufferedAllowedPct;
-        const nearLimit = lossPct > allowedPct && lossPct <= bufferedAllowedPct;
-        const cls = exceeded ? 'num-neg' : nearLimit ? '' : 'muted';
-        const style = nearLimit ? 'color: var(--yellow);' : '';
-        riskHtml = `<div class="entry-card-meta" style="margin-top:4px;">Risk: <span class="${cls}" style="${style}">${exceeded ? '⚠ ' : ''}${lossPct.toFixed(2)}%</span> av köpt belopp (${formatMoney(-g.entryCost)}) · mål ${allowedPct.toFixed(2)}% · gräns m. marginal ${bufferedAllowedPct.toFixed(2)}% vid X${leverage}</div>`;
+      if (g.totalResult < 0) {
+        const lossPct = (-g.totalResult / g.entryCost) * 100;
+        if (leverage) {
+          const allowedPct = baseMove * leverage;
+          const tol = tolerancePct === undefined || tolerancePct === null ? RULE_DEFAULT_TOLERANCE_PCT : tolerancePct;
+          const bufferedAllowedPct = allowedPct * (1 + tol / 100);
+          const exceeded = lossPct > bufferedAllowedPct;
+          const nearLimit = lossPct > allowedPct && lossPct <= bufferedAllowedPct;
+          const cls = exceeded ? 'num-neg' : nearLimit ? '' : 'muted';
+          const style = nearLimit ? 'color: var(--yellow);' : '';
+          riskHtml = `<div class="entry-card-meta" style="margin-top:4px;">Risk: <span class="${cls}" style="${style}">${exceeded ? statusDotHtml('warn') : ''}${lossPct.toFixed(2)}%</span> av köpt belopp (${formatMoney(-g.entryCost)}) · mål ${allowedPct.toFixed(2)}% · gräns m. marginal ${bufferedAllowedPct.toFixed(2)}% vid X${leverage}${exceeded ? ' · över riskbudget' : ''}</div>`;
+        } else {
+          riskHtml = `<div class="entry-card-meta muted" style="margin-top:4px;">Risk: ${lossPct.toFixed(2)}% av köpt belopp (${formatMoney(-g.entryCost)}) · hävstång okänd</div>`;
+        }
       } else {
-        riskHtml = `<div class="entry-card-meta muted" style="margin-top:4px;">Risk: ${lossPct.toFixed(2)}% av köpt belopp (${formatMoney(-g.entryCost)}) · hävstång okänd</div>`;
+        const gainPct = (g.totalResult / g.entryCost) * 100;
+        riskHtml = `<div class="entry-card-meta" style="margin-top:4px;">Resultat: <span class="num-pos">+${gainPct.toFixed(2)}%</span> av köpt belopp (${formatMoney(-g.entryCost)})</div>`;
       }
     }
 
@@ -650,7 +697,7 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct) {
     <div class="entry-card">
       <div class="entry-card-head">
         <div>
-          <div class="entry-card-title">${escapeHtml(g.instrument)} <span class="pill ${statusClass}" style="margin-left:8px;">${escapeHtml(statusLabel)}</span></div>
+          <div class="entry-card-title">Trade ${gi + 1}: ${escapeHtml(g.instrument)} <span class="pill ${statusClass}" style="margin-left:8px;">${escapeHtml(statusLabel)}</span></div>
           <div class="entry-card-meta">
             ${g.entryQty > 0 ? `Entry: ${formatNum(g.entryQty, 0)} st @ snitt ${formatNum(g.avgEntryPrice, 4)} (${formatMoney(-g.entryCost)})` : 'Entry: okänd (positionen fanns redan innan denna dag)'}
             ${g.exitQty > 0 ? ` · Stängt: ${formatNum(g.exitQty, 0)} st i ${g.exitLegs.length} del${g.exitLegs.length > 1 ? 'ar' : ''}` : ' · Fortfarande öppen'}
@@ -711,24 +758,28 @@ function computeDayStats(dayTrades) {
  */
 function dayInsight(stats) {
   if (stats.tradeCount === 0) {
-    return { show: false, icon: 'ℹ', tone: 'neutral', text: 'Inga trades denna dag.' };
+    return { show: false, tone: 'neutral', text: 'Inga trades denna dag.' };
   }
   if (stats.giveback <= 0.01) {
     if (stats.totalPnl >= 0) {
-      return { show: false, icon: 'ℹ', tone: 'neutral', text: 'Inget tecken på övertradning – dagens resultat är samma som (eller mycket nära) dagens bästa punkt.' };
+      return { show: false, tone: 'neutral', text: 'Inget tecken på övertradning – dagens resultat är samma som (eller mycket nära) dagens bästa punkt.' };
     }
-    return { show: true, icon: 'ℹ', tone: 'neutral', text: 'Dagen var på minus rakt igenom, utan att någon gång ha varit bättre än så här.' };
+    return { show: true, tone: 'neutral', text: 'Dagen var på minus rakt igenom, utan att någon gång ha varit bättre än så här.' };
   }
   const peakWasPositive = stats.peak > 0.01;
   const base = `Du låg som ${peakWasPositive ? 'mest på' : 'bäst på'} ${formatMoney(stats.peak)} (vid trade #${stats.peakIndex + 1}) men avslutade på ${formatMoney(stats.totalPnl)} – ${formatMoney(stats.giveback)} gavs tillbaka efteråt.`;
   if (stats.totalPnl < 0 && peakWasPositive) {
-    return { show: true, icon: '⚠', tone: 'danger', text: base + ' Ett tydligt tecken på övertradning: vinsten vändes till förlust.' };
+    return { show: true, tone: 'danger', text: base + ' Ett tydligt tecken på övertradning: vinsten vändes till förlust.' };
   }
   if (stats.totalPnl < 0 && !peakWasPositive) {
-    return { show: true, icon: '⚠', tone: 'danger', text: base + ' Dagen var aldrig på plus, men förlusten växte efter din bästa punkt – ett tecken på att handeln kanske borde stoppats tidigare.' };
+    return { show: true, tone: 'danger', text: base + ' Dagen var aldrig på plus, men förlusten växte efter din bästa punkt – ett tecken på att handeln kanske borde stoppats tidigare.' };
   }
-  return { show: true, icon: 'ℹ', tone: 'info', text: base + ' Ett möjligt tecken på övertradning, även om dagen ändå slutade på plus.' };
+  return { show: true, tone: 'info', text: base + ' Ett möjligt tecken på övertradning, även om dagen ändå slutade på plus.' };
 }
+
+/* Mappar en insight/tone till en status-dot-klass (CSS-cirkel istället för emoji). */
+function toneDotClass(tone) { return tone === 'danger' ? 'warn' : (tone === 'info' || tone === 'neutral') ? tone : 'info'; }
+function statusDotHtml(tone) { return `<span class="status-dot ${toneDotClass(tone)}"></span>`; }
 
 // Behåller det gamla namnet som en tunn wrapper (kalendermodal/dagsdetalj kan fortsätta be om ren text).
 function overtradingVerdictText(stats) { return dayInsight(stats).text; }
@@ -743,7 +794,7 @@ function renderCompactTradeTable(stats) {
       <td class="${t.type === 'Köp' ? 'tag-buy' : 'tag-sell'}">${escapeHtml(t.type)}</td>
       <td>${escapeHtml(t.instrument)}</td>
       <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
-      <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeak ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;">🏁 Hit borde du stannat</span>' : ''}</td>
+      <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeak ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;"><span class="status-dot ok" style="margin-right:5px;"></span>Hit borde du stannat</span>' : ''}</td>
     </tr>`;
   }).join('');
   return `
@@ -758,6 +809,14 @@ async function openDayInfoModal(date) {
   const dayTrades = await dbGetAllByIndex('trades', 'date', date);
   const stats = computeDayStats(dayTrades);
   const insight = dayInsight(stats);
+
+  const rules = await dbGetAll('rules');
+  const activeRiskRule = rules.find(r => r.type === 'max_risk_pct_leveraged' && r.active !== false);
+  const baseMovePct = activeRiskRule ? activeRiskRule.threshold : RULE_DEFAULT_THRESHOLDS.max_risk_pct_leveraged;
+  const riskTolerancePct = activeRiskRule ? activeRiskRule.tolerancePct : undefined;
+  const ascTrades = dayTrades.slice().sort((a, b) => a.fileOrder - b.fileOrder);
+  const groups = computeTradeGroupsForDay(ascTrades);
+
   const modalHtml = `
     <h2>${formatDateHuman(date)}</h2>
     <div class="stat-row">
@@ -766,9 +825,13 @@ async function openDayInfoModal(date) {
       ${statBox('Gav tillbaka', stats.giveback > 0.01 ? formatMoney(stats.giveback) : '0,00 kr', stats.giveback > 0.01 ? 'neg' : '')}
       ${statBox('Träffsäkerhet', stats.winRate !== null ? stats.winRate.toFixed(0) + '%' : '–')}
     </div>
-    <p class="muted small" style="line-height:1.5;">${insight.icon} ${escapeHtml(insight.text)}</p>
-    <div style="max-height: 360px; overflow-y: auto;">
-      ${stats.tradeCount > 0 ? `<p class="muted small" style="margin-bottom:0;">Alla transaktioner denna dag:</p>${renderCompactTradeTable(stats)}` : ''}
+    <p class="muted small" style="line-height:1.5;">${statusDotHtml(insight.tone)}${escapeHtml(insight.text)}</p>
+    <div style="max-height: 420px; overflow-y: auto;">
+      ${groups.length > 0 ? `
+        <p class="muted small" style="margin-bottom:6px;">Dagens trades, ihopparade (entry + ev. TP1/TP2/TP3... vid delvisa uttag). Avanzas export har inget klockslag, bara datum och radordning.</p>
+        <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct)}</div>
+      ` : ''}
+      ${stats.tradeCount > 0 ? `<p class="muted small" style="margin:16px 0 0;">Alla transaktioner denna dag, rå ordning:</p>${renderCompactTradeTable(stats)}` : ''}
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" id="dayInfoClose">Stäng</button>
@@ -777,10 +840,16 @@ async function openDayInfoModal(date) {
   `;
   openModal(modalHtml);
   document.getElementById('dayInfoClose').addEventListener('click', closeModal);
-  document.getElementById('dayInfoOpenDetail').addEventListener('click', () => {
+  document.querySelectorAll('#modal .group-journal-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      closeModal();
+      openJournalForm(null, { date, tradeId: parseInt(btn.dataset.tradeId, 10) });
+    });
+  });
+  document.getElementById('dayInfoOpenDetail').addEventListener('click', async () => {
     closeModal();
-    switchView('overview');
-    openDayDetail(date, false);
+    await switchView('overview');
+    await openDayDetail(date, false);
   });
 }
 
@@ -825,7 +894,7 @@ async function openDayDetail(date, reversed, viewMode) {
 
   const overtradeHtml = insight.show ? `
     <div class="rule-row" style="background: linear-gradient(120deg, rgba(255,200,92,0.14), rgba(${overtradedWarning ? '255,93,120' : '43,230,160'},0.10)); border: 1px solid rgba(255,200,92,0.35); border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px;">
-      <span>${insight.icon} ${escapeHtml(insight.text)}</span>
+      <span>${statusDotHtml(insight.tone)}${escapeHtml(insight.text)}</span>
     </div>
   ` : '';
 
@@ -834,7 +903,7 @@ async function openDayDetail(date, reversed, viewMode) {
     const compliance = evaluateDayCompliance(trades, rules);
     complianceHtml = `
       <div class="rule-row">
-        <strong>${compliance.compliant ? '✓ Alla regler följdes' : compliance.violations.length + ' regelbrott denna dag'}</strong>
+        <strong>${compliance.compliant ? statusDotHtml('ok') + 'Alla regler följdes' : compliance.violations.length + ' regelbrott denna dag'}</strong>
       </div>
       <div class="rule-violation-list">
         ${compliance.compliant
@@ -853,7 +922,7 @@ async function openDayDetail(date, reversed, viewMode) {
       const title = risk.exceeded
         ? `X${risk.leverage} hävstång · mål ${risk.allowedPct.toFixed(2)}% · gräns m. marginal ${risk.bufferedAllowedPct.toFixed(2)}% · vid hållen SL: -${formatNum(risk.hypotheticalLossKr, 2)} kr (${formatNum(risk.savingsKr, 2)} kr sparat)`
         : `X${risk.leverage} hävstång · mål ${risk.allowedPct.toFixed(2)}% · gräns m. marginal ${risk.bufferedAllowedPct.toFixed(2)}%`;
-      riskCell = `<span class="${cls}" style="${style}" title="${title}">${risk.exceeded ? '⚠ ' : ''}${risk.lossPct.toFixed(2)}% / ${risk.allowedPct.toFixed(2)}%</span>`;
+      riskCell = `<span class="${cls}" style="${style}" title="${title}">${risk.exceeded ? statusDotHtml('warn') : ''}${risk.lossPct.toFixed(2)}% / ${risk.allowedPct.toFixed(2)}%</span>`;
     } else if (!parseLeverage(t.instrument) && t.type === 'Sälj' && t.result < 0) {
       riskCell = '<span class="muted" title="Kunde inte tolka hävstång ur namnet">okänd</span>';
     }
@@ -867,7 +936,7 @@ async function openDayDetail(date, reversed, viewMode) {
       <td>${formatNum(t.price, 4)}</td>
       <td>${t.amount != null ? formatMoney(t.amount) : ''}</td>
       <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
-      <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeakRow ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;">🏁 Hit borde du stannat</span>' : ''}</td>
+      <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeakRow ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;"><span class="status-dot ok" style="margin-right:5px;"></span>Hit borde du stannat</span>' : ''}</td>
       <td>${riskCell}</td>
       <td><button class="btn btn-ghost btn-small journal-from-trade" data-id="${t.id}">+ Journal</button></td>
     </tr>
@@ -876,7 +945,7 @@ async function openDayDetail(date, reversed, viewMode) {
 
   const riskNoteHtml = overriskedCount > 0 ? `
     <div class="rule-row" style="background: rgba(255,93,120,0.10); border: 1px solid rgba(255,93,120,0.3); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 16px;">
-      <span>⚠ ${overriskedCount} trade${overriskedCount > 1 ? 's' : ''} denna dag förlorade mer än din riskbudget (${formatNum(baseMovePct, 2)}% × hävstång, motsvarande 55 pips i guldets pris) – även efter marginalen för Avanzas SL-avrundning. Om SL hade hållits på målet hade dagen slutat ${formatMoney(totalSavingsKr)} bättre (${formatMoney(hypotheticalDayPnl)} istället för ${formatMoney(totalPnl)}). Se kolumnen "Risk" i tabellen.</span>
+      <span>${statusDotHtml('warn')}${overriskedCount} trade${overriskedCount > 1 ? 's' : ''} denna dag förlorade mer än din riskbudget (${formatNum(baseMovePct, 2)}% × hävstång, motsvarande 55 pips i guldets pris) – även efter marginalen för Avanzas SL-avrundning. Om SL hade hållits på målet hade dagen slutat ${formatMoney(totalSavingsKr)} bättre (${formatMoney(hypotheticalDayPnl)} istället för ${formatMoney(totalPnl)}). Se kolumnen "Risk" i tabellen.</span>
     </div>
   ` : '';
 
@@ -1607,6 +1676,21 @@ function setupHeatmapNav() {
   });
 }
 
+function setupOverviewMetricToggle() {
+  document.getElementById('overviewMetricFinalBtn').addEventListener('click', () => {
+    overviewMetric = 'final';
+    document.getElementById('overviewMetricFinalBtn').className = 'btn btn-small btn-primary';
+    document.getElementById('overviewMetricPeakBtn').className = 'btn btn-small btn-secondary';
+    renderOverview();
+  });
+  document.getElementById('overviewMetricPeakBtn').addEventListener('click', () => {
+    overviewMetric = 'peak';
+    document.getElementById('overviewMetricPeakBtn').className = 'btn btn-small btn-primary';
+    document.getElementById('overviewMetricFinalBtn').className = 'btn btn-small btn-secondary';
+    renderOverview();
+  });
+}
+
 /* ---------- Gamification: streaks & badges ---------- */
 async function computeStreaks() {
   const trades = await dbGetAll('trades');
@@ -1628,15 +1712,15 @@ async function computeStreaks() {
 }
 
 const BADGE_DEFS = [
-  { id: 'first_import', icon: '🚀', label: 'Första importen', check: (ctx) => ctx.tradeCount >= 1 },
-  { id: 'ten_trades', icon: '📊', label: '10 trades loggade', check: (ctx) => ctx.tradeCount >= 10 },
-  { id: 'fifty_trades', icon: '💯', label: '50 trades loggade', check: (ctx) => ctx.tradeCount >= 50 },
-  { id: 'streak3', icon: '🔥', label: '3 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 3 },
-  { id: 'streak7', icon: '⚡', label: '7 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 7 },
-  { id: 'journaler', icon: '📓', label: 'Journalförare (5+)', check: (ctx) => ctx.journalCount >= 5 },
-  { id: 'educated', icon: '🎓', label: 'Utbildad (3+ material)', check: (ctx) => ctx.educationCount >= 3 },
-  { id: 'bias_tracker', icon: '🥇', label: 'Guldbias-koll (5+)', check: (ctx) => ctx.biasCount >= 5 },
-  { id: 'rule_setter', icon: '🛡️', label: 'Regler satta', check: (ctx) => ctx.ruleCount >= 1 },
+  { id: 'first_import', icon: 'GO', label: 'Första importen', check: (ctx) => ctx.tradeCount >= 1 },
+  { id: 'ten_trades', icon: '10', label: '10 trades loggade', check: (ctx) => ctx.tradeCount >= 10 },
+  { id: 'fifty_trades', icon: '50', label: '50 trades loggade', check: (ctx) => ctx.tradeCount >= 50 },
+  { id: 'streak3', icon: '3×', label: '3 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 3 },
+  { id: 'streak7', icon: '7×', label: '7 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 7 },
+  { id: 'journaler', icon: 'J', label: 'Journalförare (5+)', check: (ctx) => ctx.journalCount >= 5 },
+  { id: 'educated', icon: 'E', label: 'Utbildad (3+ material)', check: (ctx) => ctx.educationCount >= 3 },
+  { id: 'bias_tracker', icon: 'Au', label: 'Guldbias-koll (5+)', check: (ctx) => ctx.biasCount >= 5 },
+  { id: 'rule_setter', icon: 'R', label: 'Regler satta', check: (ctx) => ctx.ruleCount >= 1 },
 ];
 
 async function renderAchievements() {
@@ -1658,7 +1742,7 @@ async function renderAchievements() {
     banner.innerHTML = `<span class="muted">Importera trades för att börja bygga din statistik och dina badges.</span>`;
   } else {
     banner.innerHTML = `
-      <span class="streak-icon">🔥</span>
+      <span class="streak-icon"></span>
       <div class="streak-figure"><span class="num">${streaks.current}</span><span class="lbl">Nuvarande vinststreak</span></div>
       <div class="streak-figure"><span class="num">${streaks.best}</span><span class="lbl">Bästa streak</span></div>
       <div class="streak-figure"><span class="num">${streaks.tradingDays}</span><span class="lbl">Handelsdagar totalt</span></div>
@@ -1690,16 +1774,22 @@ function animateNumber(el, targetValue, formatter) {
 }
 
 /* ---------- Navigation & init ---------- */
+/*
+ * Byter aktiv flik och kör respektive render-funktion. Returnerar render-funktionens promise så
+ * att anropare kan invänta att sidan faktiskt är klarritad innan de gör något beroende av det
+ * (t.ex. öppna dagsdetalj direkt efter – annars kan renderOverview()'s "dölj dagsdetalj"-rad
+ * hinna köra EFTER att dagsdetaljen redan visats, i fel ordning, och osynliggöra den igen).
+ */
 function switchView(view) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
   document.getElementById('view-' + view).classList.remove('hidden');
-  if (view === 'overview') renderOverview();
-  if (view === 'import') renderImportHistory();
-  if (view === 'journal') renderJournalList();
-  if (view === 'education') renderEducationList();
-  if (view === 'goldbias') renderBiasList();
-  if (view === 'rules') renderRulesList();
+  if (view === 'overview') return renderOverview();
+  if (view === 'import') return renderImportHistory();
+  if (view === 'journal') return renderJournalList();
+  if (view === 'education') return renderEducationList();
+  if (view === 'goldbias') return renderBiasList();
+  if (view === 'rules') return renderRulesList();
 }
 
 function setupGlobalUI() {
@@ -1731,6 +1821,7 @@ function setupGlobalUI() {
   document.getElementById('biasFilter').addEventListener('change', renderBiasList);
 
   setupHeatmapNav();
+  setupOverviewMetricToggle();
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
