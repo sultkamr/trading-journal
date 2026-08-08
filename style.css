@@ -380,6 +380,8 @@ table.trade-table tr:last-child td { border-bottom: none; }
 .tag-sell { color: var(--yellow); font-weight: 600; }
 .num-pos { color: var(--green); }
 .num-neg { color: var(--red); }
+tr.peak-row td { background: rgba(255,200,92,0.10); }
+tr.peak-row td:first-child { box-shadow: inset 3px 0 0 var(--yellow); }
 
 .chart-wrap { height: 260px; margin: 16px 0; }
 
