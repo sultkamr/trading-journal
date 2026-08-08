@@ -42,10 +42,11 @@
 
     <div class="card streak-card" id="achievementsCard">
       <div class="card-header">
-        <h2>Prestationer</h2>
+        <h2>Statistik</h2>
       </div>
       <div id="streakBanner" class="streak-banner"></div>
-      <div id="badgeShelf" class="badge-shelf"></div>
+      <p class="muted small" style="margin: 14px 0 10px;">Nyckeltal över hela din handelshistorik, samma typ av mått som prop firms och institutionella tradingdesks följer upp – räknat per hel position (entry + ev. TP1/TP2/TP3), inte per enskild transaktionsrad.</p>
+      <div id="badgeShelf" class="stat-row"></div>
     </div>
 
     <div class="card" id="heatmapCard">
@@ -68,7 +69,7 @@
         <span class="legend-swatch l4"></span><span class="legend-swatch l3"></span><span class="legend-swatch l2"></span><span class="legend-swatch l1"></span><span class="legend-swatch l0"></span><span class="legend-swatch w1"></span><span class="legend-swatch w2"></span><span class="legend-swatch w3"></span><span class="legend-swatch w4"></span>
         <span>Vinst</span>
       </div>
-      <p class="muted small" style="margin-top:10px;">Klicka på en dag för att se vad som hände, vad som hade kunnat gå bättre och om det var övertradning. Kolumnen längst till höger visar varje veckas (svenskt veckonummer) totala resultat.</p>
+      <p class="muted small" style="margin-top:10px;">Klicka på en dag med trades för att se vad som hände, vad som hade kunnat gå bättre och om det var övertradning. Klicka på en tom dag för att importera en CSV direkt, utan att byta till fliken Importera. Kolumnen längst till höger visar varje veckas (svenskt veckonummer) totala resultat.</p>
     </div>
 
     <div class="card" id="dayListCard">
@@ -111,6 +112,12 @@
           <option value="date_desc">Handelsdatum, senaste först</option>
           <option value="date_asc">Handelsdatum, äldsta först</option>
         </select>
+      </div>
+      <div class="filter-row" id="importBulkBar" style="margin-bottom:10px; align-items:center; display:none;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:0.85rem; color:var(--text-muted); align-self:center;">
+          <input type="checkbox" id="importSelectAll"> Markera alla
+        </label>
+        <button class="btn btn-danger btn-small" id="importDeleteSelected" style="margin-top:0;" disabled>Ta bort valda (0)</button>
       </div>
       <div id="importHistory"></div>
     </div>

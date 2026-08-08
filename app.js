@@ -216,6 +216,50 @@ function renderImageUploadWidget(containerEl, imagesArr) {
   });
 }
 
+/* ---------- Generell filuppladdning (t.ex. avräkningsnota/PDF) ---------- */
+// Till skillnad från bilder komprimeras dessa inte (kan inte förlustfritt canvas-komprimera en PDF)
+// och de renderas som nedladdningsbara filchips istället för miniatyrbilder.
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = () => reject(new Error('Kunde inte läsa filen'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function fileChipHtml(f, removable, i) {
+  return `<span class="file-chip">
+    <a href="${f.dataUrl}" target="_blank" rel="noopener" download="${escapeHtml(f.name)}" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</a>
+    ${removable ? `<button type="button" class="remove-file" data-i="${i}">✕</button>` : ''}
+  </span>`;
+}
+
+function renderFileUploadWidget(containerEl, filesArr) {
+  const inputId = containerEl.id + '_input';
+  containerEl.innerHTML =
+    filesArr.map((f, i) => fileChipHtml(f, true, i)).join('') +
+    `<label class="file-add-btn" for="${inputId}">+ Bifoga PDF (t.ex. avräkningsnota)<input type="file" accept="application/pdf,.pdf" multiple hidden id="${inputId}"></label>`;
+
+  containerEl.querySelectorAll('.remove-file').forEach(btn => {
+    btn.addEventListener('click', () => {
+      filesArr.splice(parseInt(btn.dataset.i, 10), 1);
+      renderFileUploadWidget(containerEl, filesArr);
+    });
+  });
+  const input = containerEl.querySelector('input[type=file]');
+  input.addEventListener('change', async (e) => {
+    const chosen = Array.from(e.target.files);
+    for (const f of chosen) {
+      try {
+        const dataUrl = await readFileAsDataUrl(f);
+        filesArr.push({ name: f.name, dataUrl });
+      } catch (err) { console.error(err); }
+    }
+    renderFileUploadWidget(containerEl, filesArr);
+  });
+}
+
 /* ---------- Avanza CSV Import ---------- */
 function parseSwedishNumber(s) {
   if (s === undefined || s === null) return null;
@@ -269,9 +313,17 @@ function parseAvanzaCSV(text) {
       instrumentCurrency: (cols[idx.instrumentCurrency] || '').trim(),
       isin: (cols[idx.isin] || '').trim(),
       result: idx.result > -1 ? parseSwedishNumber(cols[idx.result]) : null,
-      fileOrder: i - 1,
     });
   }
+  // Avanzas transaktionsexport listar raderna NYAST FÖRST (senaste transaktionen överst i filen) –
+  // men resten av appen (ihopparning av Köp/Sälj-ben till positioner, "löpande resultat", vilket ben
+  // som är dagens topp osv) förutsätter att en STIGANDE fileOrder motsvarar kronologisk ordning, äldst
+  // till nyast. Utan denna vändning paras positionerna ihop i fel riktning – ett helt normalt Köp-sen-
+  // Sälj samma dag läses som Sälj-sen-Köp och flaggas felaktigt som "position öppnad innan denna dag",
+  // och "Trade 1" hamnar på dagens SISTA position istället för den första. Verifierat mot exakta
+  // klockslag från riktiga avräkningsnotor. Sista raden i filen (kronologiskt äldst) får fileOrder 0.
+  const n = rows.length;
+  rows.forEach((r, idx) => { r.fileOrder = n - 1 - idx; });
   return rows;
 }
 
@@ -388,11 +440,25 @@ function renderImportResultsSummary(results) {
     `;
   }).join('');
 
+  // Vid en enda fil visas detaljerna direkt. Vid flera filer på en gång skulle en fullständig rad
+  // per fil göra att sammanfattningen sväller ut och tar upp nästan hela sidan (det användaren såg
+  // och tyckte "ligger över sidan" efter att ha importerat 12 filer samtidigt) – därför visas bara
+  // totalsumman direkt, med detaljerna per fil bakom en "Visa detaljer"-knapp.
+  const isMulti = results.length > 1;
   resultEl.innerHTML = `
-    ${results.length > 1 ? `<p class="value ${failed.length ? (ok.length ? '' : 'neg') : 'pos'}">${results.length} filer bearbetade: ${totalInserted} transaktioner importerade totalt${totalSkipped ? `, ${totalSkipped} dubbletter hoppades över` : ''}${failed.length ? `, ${failed.length} fil${failed.length > 1 ? 'er' : ''} misslyckades` : ''}.</p>` : ''}
-    ${perFileHtml}
+    ${isMulti ? `<p class="value ${failed.length ? (ok.length ? '' : 'neg') : 'pos'}">${results.length} filer bearbetade: ${totalInserted} transaktioner importerade totalt${totalSkipped ? `, ${totalSkipped} dubbletter hoppades över` : ''}${failed.length ? `, ${failed.length} fil${failed.length > 1 ? 'er' : ''} misslyckades` : ''}.</p>` : ''}
+    ${isMulti ? `<button class="btn btn-ghost btn-small" id="importResultToggleDetails" style="margin-top:8px;">Visa detaljer för alla ${results.length} filer</button><div id="importResultDetails" class="hidden">${perFileHtml}</div>` : perFileHtml}
     ${ok.length ? '<p class="muted small" style="margin-top:10px;">Gå till <strong>Översikt</strong> för att se resultatet dag för dag.</p>' : ''}
   `;
+
+  const toggleBtn = document.getElementById('importResultToggleDetails');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', () => {
+      const details = document.getElementById('importResultDetails');
+      const nowHidden = details.classList.toggle('hidden');
+      toggleBtn.textContent = nowHidden ? `Visa detaljer för alla ${results.length} filer` : 'Dölj detaljer';
+    });
+  }
 }
 
 async function handleCSVImportFiles(fileList) {
@@ -420,30 +486,119 @@ async function handleCSVImport(file) {
   return handleCSVImportFiles([file]);
 }
 
-async function deleteImportBatch(batchId) {
-  const batch = await dbGet('importBatches', batchId);
-  if (!batch) return;
+// Om två importer täcker exakt samma datumintervall (den ena flaggas som "Möjlig dubblett" av den
+// andra) äger BARA en av dem faktiskt transaktionerna – den andra la inte till några nya rader
+// eftersom allt redan fanns (dedupliceringen skippar dem). Om man då raderar den import som äger
+// transaktionerna försvinner de helt från kalendern, trots att "dubblett-importen" fortfarande finns
+// kvar i listan – det var precis det som rapporterades som en bugg. Lösningen: när man raderar en
+// import som har kopplade transaktioner OCH det finns en annan import kvar för exakt samma datum,
+// flyttas transaktionerna dit istället för att raderas, så att datan inte försvinner bara för att man
+// städar bort en specifik importpost.
+async function removeBatchAndTrades(batch, allBatchesSnapshot, batchIdsBeingDeleted) {
   const tradeIds = batch.tradeIds || [];
-  const label = batch.dateFrom ? (batch.dateFrom === batch.dateTo ? formatDateHuman(batch.dateFrom) : `${batch.dateFrom} – ${batch.dateTo}`) : batch.filename;
-  const msg = tradeIds.length
-    ? `Ta bort importen "${label}"? ${tradeIds.length} transaktioner tas bort permanent.`
-    : `Ta bort importposten "${label}"? (Inga kopplade transaktioner hittades att ta bort.)`;
-  if (!confirm(msg)) return;
+  const sibling = batch.dateFrom
+    ? allBatchesSnapshot.find(b => b.id !== batch.id && b.dateFrom === batch.dateFrom && b.dateTo === batch.dateTo && !batchIdsBeingDeleted.has(b.id))
+    : null;
+  if (sibling && tradeIds.length > 0) {
+    const freshSibling = await dbGet('importBatches', sibling.id).catch(() => null);
+    if (freshSibling) {
+      const merged = Object.assign({}, freshSibling, {
+        tradeIds: (freshSibling.tradeIds || []).concat(tradeIds),
+        inserted: (freshSibling.inserted || 0) + tradeIds.length,
+      });
+      await dbPut('importBatches', merged);
+      await dbDelete('importBatches', batch.id);
+      return { transferred: tradeIds.length, deletedTrades: 0 };
+    }
+  }
   for (const tid of tradeIds) {
     await dbDelete('trades', tid).catch(() => {});
   }
-  await dbDelete('importBatches', batchId);
+  await dbDelete('importBatches', batch.id);
+  return { transferred: 0, deletedTrades: tradeIds.length };
+}
+
+async function deleteImportBatch(batchId) {
+  const batch = await dbGet('importBatches', batchId);
+  if (!batch) return;
+  const allBatches = await dbGetAll('importBatches');
+  const tradeIds = batch.tradeIds || [];
+  const sibling = batch.dateFrom ? allBatches.find(b => b.id !== batch.id && b.dateFrom === batch.dateFrom && b.dateTo === batch.dateTo) : null;
+  const label = batch.dateFrom ? (batch.dateFrom === batch.dateTo ? formatDateHuman(batch.dateFrom) : `${batch.dateFrom} – ${batch.dateTo}`) : batch.filename;
+  const msg = (sibling && tradeIds.length > 0)
+    ? `Ta bort importposten "${label}"? Det finns en till import för samma datum (${sibling.filename}) – de ${tradeIds.length} transaktionerna flyttas dit så att de inte försvinner från kalendern.`
+    : tradeIds.length
+      ? `Ta bort importen "${label}"? ${tradeIds.length} transaktioner tas bort permanent.`
+      : `Ta bort importposten "${label}"? (Inga kopplade transaktioner hittades att ta bort.)`;
+  if (!confirm(msg)) return;
+  const result = await removeBatchAndTrades(batch, allBatches, new Set([batchId]));
+  selectedBatchIds.delete(batchId);
   renderImportHistory();
   renderOverview();
-  showToast('Import borttagen');
+  showToast(result.transferred > 0 ? 'Import borttagen, transaktionerna flyttades till den andra importen för samma datum' : 'Import borttagen');
 }
+
+// Håller reda på vilka importer som är ikryssade för massradering, mellan omritningar av listan
+// (t.ex. när sorteringen ändras) tills de faktiskt raderas eller vyn lämnas.
+let selectedBatchIds = new Set();
+
+function updateImportBulkBar(totalCount) {
+  const bar = document.getElementById('importBulkBar');
+  const deleteBtn = document.getElementById('importDeleteSelected');
+  const selectAll = document.getElementById('importSelectAll');
+  if (!bar) return;
+  bar.style.display = totalCount > 0 ? 'flex' : 'none';
+  const n = selectedBatchIds.size;
+  deleteBtn.textContent = `Ta bort valda (${n})`;
+  deleteBtn.disabled = n === 0;
+  if (selectAll) selectAll.checked = totalCount > 0 && n === totalCount;
+}
+
+async function deleteSelectedBatches() {
+  if (selectedBatchIds.size === 0) return;
+  const allBatches = await dbGetAll('importBatches');
+  const toDelete = allBatches.filter(b => selectedBatchIds.has(b.id));
+  if (toDelete.length === 0) return;
+  const totalTrades = toDelete.reduce((s, b) => s + ((b.tradeIds && b.tradeIds.length) || 0), 0);
+  const msg = `Ta bort ${toDelete.length} valda importer? ${totalTrades} transaktioner berörs (de som har en annan import kvar för exakt samma datum flyttas dit istället för att raderas, så de inte försvinner från kalendern).`;
+  if (!confirm(msg)) return;
+  const idsBeingDeleted = new Set(toDelete.map(b => b.id));
+  let transferredTotal = 0;
+  for (const b of toDelete) {
+    const r = await removeBatchAndTrades(b, allBatches, idsBeingDeleted);
+    transferredTotal += r.transferred;
+  }
+  const deletedCount = toDelete.length;
+  selectedBatchIds.clear();
+  renderImportHistory();
+  renderOverview();
+  showToast(deletedCount + ' importer borttagna' + (transferredTotal > 0 ? ' (' + transferredTotal + ' transaktioner flyttades till kvarvarande importer)' : ''));
+}
+
+// Vilka månadsgrupper som är utfällda i importlistan just nu (null = inte initierat än denna
+// session – den mest aktuella månaden fälls då ut automatiskt, resten börjar hopfällda).
+let expandedImportMonths = null;
+
+function importMonthKey(b) { return b.dateFrom ? b.dateFrom.slice(0, 7) : 'okänt'; }
+function importMonthLabel(b) {
+  if (!b.dateFrom) return 'Okänt datum';
+  const d = new Date(b.dateFrom + 'T00:00:00');
+  const s = d.toLocaleDateString('sv-SE', { month: 'long', year: 'numeric' });
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+function importWeekKey(b) { return b.dateFrom ? isoWeekNumber(new Date(b.dateFrom + 'T00:00:00')) : null; }
 
 async function renderImportHistory() {
   const el = document.getElementById('importHistory');
   const sortSelect = document.getElementById('importSort');
   const sortMode = sortSelect ? sortSelect.value : 'imported_desc';
   const batches = await dbGetAll('importBatches');
-  if (batches.length === 0) { el.innerHTML = '<div class="empty-state">Inga importer gjorda än.</div>'; return; }
+  if (batches.length === 0) {
+    el.innerHTML = '<div class="empty-state">Inga importer gjorda än.</div>';
+    selectedBatchIds.clear();
+    updateImportBulkBar(0);
+    return;
+  }
 
   const dateCounts = {};
   batches.forEach(b => { if (b.dateFrom) dateCounts[b.dateFrom] = (dateCounts[b.dateFrom] || 0) + 1; });
@@ -453,27 +608,88 @@ async function renderImportHistory() {
   else if (sortMode === 'date_asc') sorted.sort((a, b) => (a.dateFrom || '').localeCompare(b.dateFrom || '') || a.importedAt.localeCompare(b.importedAt));
   else sorted.sort((a, b) => b.importedAt.localeCompare(a.importedAt));
 
-  el.innerHTML = sorted.map(b => {
+  // Rensa bort ev. ikryssade id:n som inte längre finns kvar (t.ex. borttagna på annat sätt).
+  const liveIds = new Set(sorted.map(b => b.id));
+  Array.from(selectedBatchIds).forEach(id => { if (!liveIds.has(id)) selectedBatchIds.delete(id); });
+
+  if (expandedImportMonths === null) {
+    expandedImportMonths = new Set([importMonthKey(sorted[0])]);
+  }
+
+  // Grupperar listan efter månad (hopfällbar rubrik) och sedan efter ISO-vecka (liten etikett) inom
+  // varje månad, så att den inte blir rörig när det finns många importer – annars såg man bara en
+  // lång osorterad lista med alla filer.
+  const monthCounts = {};
+  sorted.forEach(b => { const k = importMonthKey(b); monthCounts[k] = (monthCounts[k] || 0) + 1; });
+
+  let html = '';
+  let lastMonthKey = null;
+  let lastWeekKey = null;
+  sorted.forEach(b => {
+    const mKey = importMonthKey(b);
+    if (mKey !== lastMonthKey) {
+      if (lastMonthKey !== null) html += '</div>';
+      const expanded = expandedImportMonths.has(mKey);
+      html += `
+        <button type="button" class="import-month-header" data-month="${mKey}">
+          <span>${escapeHtml(importMonthLabel(b))} · ${monthCounts[mKey]} import${monthCounts[mKey] === 1 ? '' : 'er'}</span>
+          <span class="import-month-caret">${expanded ? '−' : '+'}</span>
+        </button>
+        <div class="import-month-body${expanded ? '' : ' hidden'}" data-month-body="${mKey}">
+      `;
+      lastMonthKey = mKey;
+      lastWeekKey = null;
+    }
+    const wKey = importWeekKey(b);
+    if (wKey !== null && wKey !== lastWeekKey) {
+      html += `<div class="import-week-label muted small">Vecka ${wKey}</div>`;
+      lastWeekKey = wKey;
+    }
     const rangeLabel = b.dateFrom ? (b.dateFrom === b.dateTo ? formatDateHuman(b.dateFrom) : `${b.dateFrom} – ${b.dateTo}`) : 'Okänt datum';
     const isDup = b.dateFrom && dateCounts[b.dateFrom] > 1;
-    return `
+    const checked = selectedBatchIds.has(b.id) ? 'checked' : '';
+    html += `
     <div class="entry-card">
       <div class="entry-card-head">
-        <div>
-          <div class="entry-card-title">${escapeHtml(rangeLabel)} ${isDup ? '<span class="rule-chip" style="margin-left:6px;"><span class="status-dot warn" style="margin-right:5px;"></span>Möjlig dubblett</span>' : ''}</div>
-          <div class="entry-card-meta">${escapeHtml(b.filename)} · Importerad ${new Date(b.importedAt).toLocaleString('sv-SE')}</div>
+        <div style="display:flex; align-items:flex-start; gap:10px;">
+          <input type="checkbox" class="batch-select" data-id="${b.id}" ${checked} style="margin-top:5px;">
+          <div>
+            <div class="entry-card-title">${escapeHtml(rangeLabel)} ${isDup ? '<span class="rule-chip" style="margin-left:6px;"><span class="status-dot warn" style="margin-right:5px;"></span>Möjlig dubblett</span>' : ''}</div>
+            <div class="entry-card-meta">${escapeHtml(b.filename)} · Importerad ${new Date(b.importedAt).toLocaleString('sv-SE')}</div>
+          </div>
         </div>
         <div class="entry-card-actions"><button class="btn btn-danger btn-small delete-batch" data-id="${b.id}">Ta bort</button></div>
       </div>
       <div class="entry-card-meta" style="margin-top:8px;">
         ${b.inserted} importerade${b.skipped ? ' · ' + b.skipped + ' dubbletter' : ''}${b.excludedCount ? ' · ' + b.excludedCount + ' ignorerade rader' : ''}
       </div>
+      ${isDup && !b.inserted ? `<div class="entry-card-meta" style="margin-top:4px;"><span class="status-dot info" style="margin-right:5px;"></span>Alla rader fanns redan – transaktionerna för detta datum ägs av en annan import i listan, inte den här.</div>` : ''}
     </div>`;
-  }).join('');
+  });
+  if (lastMonthKey !== null) html += '</div>';
 
+  el.innerHTML = html;
+
+  el.querySelectorAll('.import-month-header').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.month;
+      const body = el.querySelector(`.import-month-body[data-month-body="${key}"]`);
+      const nowHidden = body.classList.toggle('hidden');
+      if (nowHidden) expandedImportMonths.delete(key); else expandedImportMonths.add(key);
+      btn.querySelector('.import-month-caret').textContent = nowHidden ? '+' : '−';
+    });
+  });
   el.querySelectorAll('.delete-batch').forEach(btn => {
     btn.addEventListener('click', () => deleteImportBatch(parseInt(btn.dataset.id, 10)));
   });
+  el.querySelectorAll('.batch-select').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const id = parseInt(cb.dataset.id, 10);
+      if (cb.checked) selectedBatchIds.add(id); else selectedBatchIds.delete(id);
+      updateImportBulkBar(sorted.length);
+    });
+  });
+  updateImportBulkBar(sorted.length);
 }
 
 function setupImport() {
@@ -494,6 +710,20 @@ function setupImport() {
   });
   const sortSelect = document.getElementById('importSort');
   if (sortSelect) sortSelect.addEventListener('change', renderImportHistory);
+
+  const selectAll = document.getElementById('importSelectAll');
+  if (selectAll) {
+    selectAll.addEventListener('change', () => {
+      document.querySelectorAll('#importHistory .batch-select').forEach(cb => {
+        cb.checked = selectAll.checked;
+        const id = parseInt(cb.dataset.id, 10);
+        if (selectAll.checked) selectedBatchIds.add(id); else selectedBatchIds.delete(id);
+      });
+      updateImportBulkBar(document.querySelectorAll('#importHistory .batch-select').length);
+    });
+  }
+  const deleteSelectedBtn = document.getElementById('importDeleteSelected');
+  if (deleteSelectedBtn) deleteSelectedBtn.addEventListener('click', deleteSelectedBatches);
 }
 
 /* ---------- Overview / Dashboard ---------- */
@@ -564,23 +794,14 @@ async function renderGlobalStatsRow() {
   const monthLabelText = cursorMonth.toLocaleDateString('sv-SE', { month: 'long', year: 'numeric' });
   const monthLabel = monthLabelText.charAt(0).toUpperCase() + monthLabelText.slice(1);
 
-  // "Denna vecka" visar den riktiga aktuella veckan (baserat på systemets datum) när du tittar på
-  // den månad du faktiskt befinner dig i just nu. Bläddrar du till en annan månad visas istället den
-  // månadens sista vecka, så veckonumret alltid syftar på en vecka som verkligen finns i vyn nedan –
-  // samma veckonummer och summa som står i kalenderns egen veckokolumn.
-  const now = new Date();
-  const isViewingCurrentMonth = now.getFullYear() === cursorMonth.getFullYear() && now.getMonth() === cursorMonth.getMonth();
-  const weekRefDate = isViewingCurrentMonth ? now : new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() + 1, 0);
-  const weekRange = getWeekRange(weekRefDate);
-  const weekLabel = 'Vecka ' + isoWeekNumber(weekRefDate);
-
-  const weekSum = sumMetricForRange(byDate, weekRange.start, weekRange.end, heatmapMetric);
+  // Ingen separat "vecka"-ruta här längre – veckans resultat (med svenskt veckonummer) står redan
+  // bredvid rätt rad i kalenderns egen veckokolumn nedanför, så en till ruta här bara dubblerade
+  // samma siffra (och kunde dessutom syfta på fel vecka om du bläddrat till en annan månad).
   const monthSum = sumMetricForRange(byDate, monthRange.start, monthRange.end, heatmapMetric);
   const totalSum = sumMetricForRange(byDate, new Date(0), new Date(8640000000000000), heatmapMetric);
   const metricSuffix = heatmapMetric === 'peak' ? ' (dagens topp)' : '';
 
   globalStatsEl.innerHTML =
-    statBox(weekLabel + metricSuffix, formatMoney(weekSum), weekSum >= 0 ? 'pos' : 'neg', weekSum) +
     statBox(monthLabel + metricSuffix, formatMoney(monthSum), monthSum >= 0 ? 'pos' : 'neg', monthSum) +
     statBox('Totalt resultat' + metricSuffix, formatMoney(totalSum), totalSum >= 0 ? 'pos' : 'neg', totalSum) +
     statBox('Handelsdagar', dates.length) +
@@ -737,15 +958,22 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) 
       }
     }
 
-    // Bilder kopplade till någon av positionens ben (via journalanteckningar med tradeId satt).
+    // Bilder och bifogade filer (t.ex. avräkningsnota-PDF) kopplade till någon av positionens ben
+    // (via journalanteckningar med tradeId satt).
     const linkedEntries = journalByTradeId
       ? g.legs.flatMap(t => journalByTradeId[t.id] || [])
       : [];
     const images = linkedEntries.flatMap(e => e.images || []);
+    const linkedFiles = linkedEntries.flatMap(e => e.files || []);
     const imagesHtml = images.length ? `
       <div class="entry-images" style="margin-top:10px;">
         ${images.map(src => `<img src="${src}" alt="Bild för Trade ${gi + 1}">`).join('')}
       </div>` : '';
+    const filesHtml = linkedFiles.length ? `
+      <div class="entry-files" style="margin-top:10px;">
+        ${linkedFiles.map(f => fileChipHtml(f, false)).join('')}
+      </div>` : '';
+    const hasAttachments = images.length > 0 || linkedFiles.length > 0;
 
     return `
     <div class="entry-card">
@@ -766,7 +994,8 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) 
         <tbody>${exitRows}</tbody>
       </table>` : ''}
       ${imagesHtml}
-      <div style="margin-top:10px;"><button class="btn btn-ghost btn-small group-journal-btn" data-trade-id="${lastLeg.id}">${images.length ? '+ Fler bilder/anteckning för Trade ' + (gi + 1) : '+ Bild/anteckning för Trade ' + (gi + 1)}</button></div>
+      ${filesHtml}
+      <div style="margin-top:10px;"><button class="btn btn-ghost btn-small group-journal-btn" data-trade-id="${lastLeg.id}">${hasAttachments ? '+ Fler bilder/filer för Trade ' + (gi + 1) : '+ Bild/avräkningsnota för Trade ' + (gi + 1)}</button></div>
     </div>`;
   }).join('');
 }
@@ -1159,6 +1388,7 @@ async function renderJournalList() {
       </div>
       ${e.text ? `<div class="entry-card-body">${escapeHtml(e.text)}</div>` : ''}
       ${e.images && e.images.length ? `<div class="entry-images">${e.images.map(src => `<img src="${src}">`).join('')}</div>` : ''}
+      ${e.files && e.files.length ? `<div class="entry-files" style="margin-top:8px;">${e.files.map(f => fileChipHtml(f, false)).join('')}</div>` : ''}
     </div>
   `).join('');
 
@@ -1180,9 +1410,10 @@ async function openJournalForm(existing, prefill, onDone) {
   const entry = existing || {
     date: (prefill && prefill.date) || todayISO(),
     tradeId: (prefill && prefill.tradeId) || null,
-    title: '', outcome: 'neutral', text: '', images: []
+    title: '', outcome: 'neutral', text: '', images: [], files: []
   };
   const images = (entry.images || []).slice();
+  const files = (entry.files || []).slice();
   const trades = await dbGetAllByIndex('trades', 'date', entry.date).catch(() => []);
 
   const modalHtml = `
@@ -1201,6 +1432,7 @@ async function openJournalForm(existing, prefill, onDone) {
     </div>
     <div class="form-group"><label>Anteckning</label><textarea id="jf_text" placeholder="Hur tänkte du? Vad gick bra/dåligt?">${escapeHtml(entry.text || '')}</textarea></div>
     <div class="form-group"><label>Bilder</label><div class="img-upload-row" id="jf_images"></div></div>
+    <div class="form-group"><label>Avräkningsnota / bifogade filer (PDF)</label><div class="file-upload-row" id="jf_files"></div></div>
     <div class="modal-actions">
       ${isEdit ? '<button class="btn btn-danger" id="jf_delete">Ta bort</button>' : ''}
       <button class="btn btn-ghost" id="jf_cancel">Avbryt</button>
@@ -1211,6 +1443,7 @@ async function openJournalForm(existing, prefill, onDone) {
 
   populateTradeSelect(document.getElementById('jf_trade'), trades, entry.tradeId);
   renderImageUploadWidget(document.getElementById('jf_images'), images);
+  renderFileUploadWidget(document.getElementById('jf_files'), files);
 
   document.getElementById('jf_date').addEventListener('change', async (e) => {
     const newTrades = await dbGetAllByIndex('trades', 'date', e.target.value).catch(() => []);
@@ -1241,7 +1474,7 @@ async function openJournalForm(existing, prefill, onDone) {
     const outcome = outcomeEl ? outcomeEl.dataset.val : 'neutral';
     const title = document.getElementById('jf_title').value.trim();
     const text = document.getElementById('jf_text').value.trim();
-    const payload = { date, tradeId, title, outcome, text, images, createdAt: entry.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
+    const payload = { date, tradeId, title, outcome, text, images, files, createdAt: entry.createdAt || new Date().toISOString(), updatedAt: new Date().toISOString() };
     if (isEdit) { payload.id = entry.id; await dbPut('journal', payload); } else { await dbAdd('journal', payload); }
     closeModal(); renderJournalList(); showToast('Sparat');
     if (typeof onDone === 'function') onDone();
@@ -1750,6 +1983,12 @@ async function renderHeatmap() {
           const compliance = evaluateDayCompliance(dayTrades, rules);
           if (!compliance.compliant) cls += ' rule-flag';
         }
+      } else {
+        // Tomma handelsdagar (vardagar utan importerade trades) är klickbara för att importera en
+        // CSV direkt utan att behöva byta till fliken "Importera" – vilka datum som faktiskt landar
+        // i databasen styrs fortfarande av filens eget innehåll, inte av vilken ruta man klickade på.
+        cls += ' heatmap-cell-empty';
+        pnlLabel = '<div class="dpnl-add" title="Importera CSV för denna period">+</div>';
       }
       rowHtml += `<div class="${cls}" data-date="${dateStr}"><div class="dnum">${day}</div>${pnlLabel}</div>`;
     }
@@ -1765,16 +2004,61 @@ async function renderHeatmap() {
   grid.querySelectorAll('.heatmap-cell.has-trades').forEach(cell => {
     cell.addEventListener('click', () => openDayInfoModal(cell.dataset.date));
   });
+  grid.querySelectorAll('.heatmap-cell.heatmap-cell-empty').forEach(cell => {
+    cell.addEventListener('click', () => openQuickImportModal());
+  });
+}
+
+// Liten genväg för att importera en CSV direkt från kalendern (klick på en tom vardag), så man
+// slipper byta till fliken "Importera" separat. Modalen stängs direkt när en fil väljs/släpps och
+// importen körs i bakgrunden – kalendern och statistiken uppdateras automatiskt (samma väg som en
+// vanlig import tar), och en toast bekräftar när den är klar.
+function openQuickImportModal() {
+  openModal(`
+    <h3>Importera CSV</h3>
+    <p class="muted small" style="margin-bottom:14px;">Snabbimport direkt från kalendern. Vilka datum som importeras avgörs av filens eget innehåll, inte av vilken ruta du klickade på.</p>
+    <div class="dropzone" id="quickImportDropzone">
+      <input type="file" id="quickImportFile" accept=".csv" multiple hidden>
+      <div class="dropzone-inner">
+        <div class="dropzone-icon">⇪</div>
+        <p><strong>Klicka för att välja filer</strong> eller dra och släpp CSV-filer här</p>
+        <p class="muted small">Du kan välja/släppa flera filer samtidigt.</p>
+      </div>
+    </div>
+    <div class="modal-actions" style="margin-top:16px;">
+      <button class="btn btn-ghost" id="quickImportClose">Stäng</button>
+    </div>
+  `);
+  const dz = document.getElementById('quickImportDropzone');
+  const input = document.getElementById('quickImportFile');
+  const runImport = async (files) => {
+    if (!files || !files.length) return;
+    closeModal();
+    await handleCSVImportFiles(files);
+    showToast('Import klar – se Översikt för resultatet');
+  };
+  dz.addEventListener('click', () => input.click());
+  input.addEventListener('change', (e) => { runImport(e.target.files); e.target.value = ''; });
+  dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('dragover'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+  dz.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dz.classList.remove('dragover');
+    runImport(e.dataTransfer.files);
+  });
+  document.getElementById('quickImportClose').addEventListener('click', closeModal);
 }
 
 function setupHeatmapNav() {
   document.getElementById('heatmapPrev').addEventListener('click', () => {
     heatmapCursor.setMonth(heatmapCursor.getMonth() - 1);
     renderHeatmap();
+    renderGlobalStatsRow();
   });
   document.getElementById('heatmapNext').addEventListener('click', () => {
     heatmapCursor.setMonth(heatmapCursor.getMonth() + 1);
     renderHeatmap();
+    renderGlobalStatsRow();
   });
   document.getElementById('heatmapMetricFinalBtn').addEventListener('click', () => {
     heatmapMetric = 'final';
@@ -1814,49 +2098,97 @@ async function computeStreaks() {
   return { current, best, tradingDays: dates.length };
 }
 
-const BADGE_DEFS = [
-  { id: 'first_import', icon: 'GO', label: 'Första importen', check: (ctx) => ctx.tradeCount >= 1 },
-  { id: 'ten_trades', icon: '10', label: '10 trades loggade', check: (ctx) => ctx.tradeCount >= 10 },
-  { id: 'fifty_trades', icon: '50', label: '50 trades loggade', check: (ctx) => ctx.tradeCount >= 50 },
-  { id: 'streak3', icon: '3×', label: '3 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 3 },
-  { id: 'streak7', icon: '7×', label: '7 vinstdagar i rad', check: (ctx) => ctx.bestStreak >= 7 },
-  { id: 'journaler', icon: 'J', label: 'Journalförare (5+)', check: (ctx) => ctx.journalCount >= 5 },
-  { id: 'educated', icon: 'E', label: 'Utbildad (3+ material)', check: (ctx) => ctx.educationCount >= 3 },
-  { id: 'bias_tracker', icon: 'Au', label: 'Guldbias-koll (5+)', check: (ctx) => ctx.biasCount >= 5 },
-  { id: 'rule_setter', icon: 'R', label: 'Regler satta', check: (ctx) => ctx.ruleCount >= 1 },
-];
+// Prestationsstatistik räknad över HELA handelshistoriken, per hel position (entry + ev.
+// TP1/TP2/TP3...) snarare än per enskild transaktionsrad – annars skulle en position med flera
+// delvisa uttag felaktigt räknas som flera separata "trades" i vinst/förlust-måtten. Detta är samma
+// typ av nyckeltal (träffsäkerhet, profit factor, förväntat värde, drawdown) som prop firms och
+// institutionella tradingdesks använder för att utvärdera en strategi, till skillnad från de gamla
+// "prestationsmärkena" som bara mätte hur mycket data som fanns i appen (t.ex. "10 trades loggade").
+function computeOverallPerformanceStats(allTrades) {
+  const byDate = {};
+  allTrades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
+  const dates = Object.keys(byDate).sort();
+
+  let allGroups = [];
+  const dailyPnl = [];
+  dates.forEach(d => {
+    const dayTrades = byDate[d].slice().sort((a, b) => a.fileOrder - b.fileOrder);
+    allGroups = allGroups.concat(computeTradeGroupsForDay(dayTrades));
+    dailyPnl.push({ date: d, pnl: dayTrades.reduce((s, t) => s + (t.result || 0), 0) });
+  });
+
+  const wins = allGroups.filter(g => g.totalResult > 0);
+  const losses = allGroups.filter(g => g.totalResult < 0);
+  const totalPositions = allGroups.length;
+  const winRate = totalPositions > 0 ? (wins.length / totalPositions) * 100 : null;
+  const grossProfit = wins.reduce((s, g) => s + g.totalResult, 0);
+  const grossLoss = Math.abs(losses.reduce((s, g) => s + g.totalResult, 0));
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? null : 0); // null = ingen förlust ännu (oändlig)
+  const avgWin = wins.length ? grossProfit / wins.length : 0;
+  const avgLoss = losses.length ? grossLoss / losses.length : 0;
+  const payoffRatio = avgLoss > 0 ? avgWin / avgLoss : null;
+  const expectancy = totalPositions > 0 ? (winRate / 100) * avgWin - (1 - winRate / 100) * avgLoss : 0;
+
+  // Störst nedgång (drawdown): peak-till-trough på det ackumulerade resultatet, dag för dag.
+  let equity = 0, peakEquity = 0, maxDrawdown = 0;
+  dailyPnl.forEach(d => {
+    equity += d.pnl;
+    if (equity > peakEquity) peakEquity = equity;
+    const dd = peakEquity - equity;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+  });
+
+  const bestDay = dailyPnl.reduce((best, d) => (!best || d.pnl > best.pnl) ? d : best, null);
+  const worstDay = dailyPnl.reduce((worst, d) => (!worst || d.pnl < worst.pnl) ? d : worst, null);
+  const avgPerDay = dailyPnl.length ? dailyPnl.reduce((s, d) => s + d.pnl, 0) / dailyPnl.length : 0;
+
+  let longestLossStreak = 0, curLossStreak = 0;
+  dailyPnl.forEach(d => {
+    if (d.pnl < 0) { curLossStreak++; longestLossStreak = Math.max(longestLossStreak, curLossStreak); }
+    else curLossStreak = 0;
+  });
+
+  return {
+    totalPositions, winRate, profitFactor, avgWin, avgLoss, payoffRatio, expectancy,
+    maxDrawdown, bestDay, worstDay, avgPerDay, longestLossStreak,
+  };
+}
 
 async function renderAchievements() {
-  const [trades, journal, education, goldbias, rules] = await Promise.all([
-    dbGetAll('trades'), dbGetAll('journal'), dbGetAll('education'), dbGetAll('goldbias'), dbGetAll('rules')
-  ]);
+  const trades = await dbGetAll('trades');
   const streaks = await computeStreaks();
-  const ctx = {
-    tradeCount: trades.length,
-    journalCount: journal.length,
-    educationCount: education.length,
-    biasCount: goldbias.length,
-    ruleCount: rules.length,
-    bestStreak: streaks.best,
-  };
 
   const banner = document.getElementById('streakBanner');
+  const shelf = document.getElementById('badgeShelf');
   if (trades.length === 0) {
-    banner.innerHTML = `<span class="muted">Importera trades för att börja bygga din statistik och dina badges.</span>`;
-  } else {
-    banner.innerHTML = `
-      <span class="streak-icon"></span>
-      <div class="streak-figure"><span class="num">${streaks.current}</span><span class="lbl">Nuvarande vinststreak</span></div>
-      <div class="streak-figure"><span class="num">${streaks.best}</span><span class="lbl">Bästa streak</span></div>
-      <div class="streak-figure"><span class="num">${streaks.tradingDays}</span><span class="lbl">Handelsdagar totalt</span></div>
-    `;
+    banner.innerHTML = `<span class="muted">Importera trades för att börja bygga din statistik.</span>`;
+    shelf.innerHTML = '';
+    return;
   }
 
-  const shelf = document.getElementById('badgeShelf');
-  shelf.innerHTML = BADGE_DEFS.map(b => {
-    const unlocked = b.check(ctx);
-    return `<div class="badge ${unlocked ? 'unlocked' : ''}"><span class="icon">${b.icon}</span>${escapeHtml(b.label)}</div>`;
-  }).join('');
+  banner.innerHTML = `
+    <span class="streak-icon"></span>
+    <div class="streak-figure"><span class="num">${streaks.current}</span><span class="lbl">Nuvarande vinststreak</span></div>
+    <div class="streak-figure"><span class="num">${streaks.best}</span><span class="lbl">Bästa streak</span></div>
+    <div class="streak-figure"><span class="num">${streaks.tradingDays}</span><span class="lbl">Handelsdagar totalt</span></div>
+  `;
+
+  const perf = computeOverallPerformanceStats(trades);
+  const pfLabel = perf.profitFactor === null ? (perf.avgWin > 0 ? '∞' : '–') : perf.profitFactor.toFixed(2);
+  const pfCls = perf.profitFactor === null ? (perf.avgWin > 0 ? 'pos' : '') : (perf.profitFactor >= 1 ? 'pos' : 'neg');
+  shelf.innerHTML = [
+    statBox('Träffsäkerhet (trades)', perf.winRate !== null ? perf.winRate.toFixed(0) + '%' : '–'),
+    statBox('Profit factor', pfLabel, pfCls),
+    statBox('Snittvinst', formatMoney(perf.avgWin), perf.avgWin > 0 ? 'pos' : '', perf.avgWin),
+    statBox('Snittförlust', formatMoney(-perf.avgLoss), perf.avgLoss > 0 ? 'neg' : '', -perf.avgLoss),
+    statBox('Förväntat värde / trade', formatMoney(perf.expectancy), perf.expectancy >= 0 ? 'pos' : 'neg', perf.expectancy),
+    statBox('Störst nedgång (drawdown)', formatMoney(-perf.maxDrawdown), perf.maxDrawdown > 0 ? 'neg' : '', -perf.maxDrawdown),
+    perf.bestDay ? statBox('Bästa dag', formatMoney(perf.bestDay.pnl), 'pos', perf.bestDay.pnl) : '',
+    perf.worstDay ? statBox('Sämsta dag', formatMoney(perf.worstDay.pnl), perf.worstDay.pnl < 0 ? 'neg' : '', perf.worstDay.pnl) : '',
+    statBox('Snitt / handelsdag', formatMoney(perf.avgPerDay), perf.avgPerDay >= 0 ? 'pos' : 'neg', perf.avgPerDay),
+    statBox('Längsta förlust-streak', perf.longestLossStreak + (perf.longestLossStreak === 1 ? ' dag' : ' dagar')),
+  ].join('');
+  runStatAnimations(shelf);
 }
 
 /* ---------- Animated numbers ---------- */
