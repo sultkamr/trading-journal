@@ -411,15 +411,25 @@ function matchAvrakningsnotorToTrades(notes, existingTrades) {
   const newTradeRows = [];   // ingen matchning hittades -> blir en egen ny trade-rad
 
   notes.forEach(note => {
+    // OBS: pris är MEDVETET inte ett hårt krav här längre – bara datum + typ + ISIN(eller namn) +
+    // antal avgör om en nota matchar en CSV-trade. Ett hårt priskrav (även med liten marginal) visade
+    // sig i praktiken kunna missa riktiga matchningar (CSV:ns Kurs kan vara avrundad/viktad något
+    // annorlunda än notans volymviktade snittkurs), vilket ledde till att en avräkningsnota som
+    // egentligen hörde ihop med en redan importerad CSV-rad istället skapade en HELT NY, parallell
+    // "spöktrade" – CSV och PDF "lades på varandra" istället för att komplettera varandra, precis det
+    // som rapporterades. Pris används nu bara för att välja mellan flera annars likvärdiga kandidater.
     const candidates = (byDate[note.date] || []).filter(t => {
       if (claimed.has(t.id)) return false;
       if (t.type !== note.type) return false;
-      const sameIsin = !!(note.isin && t.isin && note.isin === t.isin);
+      const sameIsin = !!(note.isin && t.isin && note.isin.trim().toUpperCase() === t.isin.trim().toUpperCase());
       const sameName = (t.instrument || '').trim() === note.instrument;
       if (!sameIsin && !sameName) return false;
-      if (Math.abs(Math.abs(t.quantity) - Math.abs(note.quantity)) > 0.001) return false;
-      if (t.price !== null && t.price !== undefined && note.price !== null && Math.abs(t.price - note.price) > 0.01) return false;
-      return true;
+      return Math.abs(Math.abs(t.quantity) - Math.abs(note.quantity)) < 0.001;
+    });
+    candidates.sort((a, b) => {
+      const da = (a.price !== null && a.price !== undefined && note.price !== null) ? Math.abs(a.price - note.price) : 0;
+      const db = (b.price !== null && b.price !== undefined && note.price !== null) ? Math.abs(b.price - note.price) : 0;
+      return da - db;
     });
     const match = candidates[0];
     if (match) {
@@ -439,6 +449,9 @@ function matchAvrakningsnotorToTrades(notes, existingTrades) {
 async function applyAvrakningsnotaImport(notes, filename) {
   if (notes.length === 0) return { filename, matched: 0, inserted: 0, skipped: 0, unparsed: 0 };
   const dates = Array.from(new Set(notes.map(n => n.date))).sort();
+  // Läk eventuella gamla spöktrades för just dessa datum FÖRST, så att dagens notor matchar mot en
+  // redan renstädad bild av datat istället för att riskera att skapa ännu en dubblett.
+  await healOrphanAvrakningsnotaTrades(dates);
   let existing = [];
   for (const d of dates) existing = existing.concat(await dbGetAllByIndex('trades', 'date', d));
 
@@ -481,6 +494,65 @@ async function applyAvrakningsnotaImport(notes, filename) {
   }
 
   return { filename, matched: matches.length, inserted: insertedIds.length, skipped: alreadyTimed.length, unparsed: 0 };
+}
+
+/* Om en avräkningsnota importerades innan matchningen var tillräckligt robust (t.ex. ett tidigare
+ * hårt priskrav som missade en riktig träff), kan en "spöktrade" ha skapats direkt från PDF:en
+ * (source: 'avrakningsnota', result: null) parallellt med den riktiga CSV-raden istället för att slås
+ * ihop med den – CSV och PDF hamnade på varandra istället för att komplettera varandra. Denna
+ * funktion läker det i efterhand: letar upp en riktig CSV-trade (har ett Resultat, saknar ännu
+ * klockslag) med samma datum/typ/ISIN(eller namn)/antal som spöktraden, flyttar över klockslaget dit
+ * och tar sedan bort spöktraden. Körs vid varje appstart samt efter varje CSV- och PDF-import, så
+ * befintlig felaktig data rättas till automatiskt utan att man behöver importera om något.
+ */
+async function healOrphanAvrakningsnotaTrades(dates) {
+  let healedCount = 0;
+  for (const d of dates) {
+    const dayTrades = await dbGetAllByIndex('trades', 'date', d);
+    const orphans = dayTrades.filter(t => t.source === 'avrakningsnota' && (t.result === null || t.result === undefined));
+    if (orphans.length === 0) continue;
+    const claimed = new Set();
+    for (const orphan of orphans) {
+      const candidate = dayTrades.find(t => {
+        if (t.id === orphan.id || claimed.has(t.id)) return false;
+        // OBS: "riktig CSV-trade" avgörs av att den INTE själv är en PDF-spöktrade (source ===
+        // 'avrakningsnota') – INTE av att den har ett Resultat, eftersom Köp-ben helt normalt saknar
+        // Resultat (det realiseras först vid Sälj). Att kräva ett Resultat här var själva buggen:
+        // den uteslöt exakt de Köp-rader som en avräkningsnota för ett köp ska matcha mot.
+        if (t.source === 'avrakningsnota') return false;
+        if (t.time) return false;
+        if (t.type !== orphan.type) return false;
+        const sameIsin = !!(orphan.isin && t.isin && orphan.isin.trim().toUpperCase() === t.isin.trim().toUpperCase());
+        const sameName = (t.instrument || '').trim() === (orphan.instrument || '').trim();
+        if (!sameIsin && !sameName) return false;
+        return Math.abs(Math.abs(t.quantity) - Math.abs(orphan.quantity)) < 0.001;
+      });
+      if (candidate) {
+        claimed.add(candidate.id);
+        await dbPut('trades', Object.assign({}, candidate, { time: orphan.time, noteNumber: orphan.noteNumber }));
+        await dbDelete('trades', orphan.id);
+        healedCount++;
+      }
+    }
+    const refreshed = await dbGetAllByIndex('trades', 'date', d);
+    if (refreshed.length > 0 && refreshed.every(t => t.time)) {
+      const sorted = refreshed.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+      for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i].fileOrder !== i) await dbPut('trades', Object.assign({}, sorted[i], { fileOrder: i }));
+      }
+    }
+  }
+  return healedCount;
+}
+
+/* Körs över HELA databasen (inte bara ett visst importtillfälles datum) – hittar alla datum som har
+ * minst en kvarvarande spöktrade och läker dem. Billigt att köra ofta eftersom en personlig
+ * handelsjournal aldrig blir så stor att en full scan är ett problem. */
+async function healAllOrphanAvrakningsnotaTrades() {
+  const all = await dbGetAll('trades');
+  const orphanDates = Array.from(new Set(all.filter(t => t.source === 'avrakningsnota' && (t.result === null || t.result === undefined)).map(t => t.date)));
+  if (orphanDates.length === 0) return 0;
+  return healOrphanAvrakningsnotaTrades(orphanDates);
 }
 
 let pdfjsLoadPromise = null;
@@ -723,6 +795,10 @@ async function handleCSVImportFiles(fileList) {
     const r = await importSingleCSVFile(file, existingSigs);
     results.push(r);
   }
+
+  // Om en avräkningsnota importerades innan denna CSV fanns kan den ha skapat en spöktrade istället
+  // för att matcha – nu när CSV-raden finns kan den läkas ihop med den automatiskt.
+  await healAllOrphanAvrakningsnotaTrades();
 
   renderImportResultsSummary(results);
   await renderImportHistory();
@@ -2567,5 +2643,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   setupGlobalUI();
   setupImport();
+  // Läker automatiskt eventuella gamla "spöktrades" från avräkningsnota-import (skapade innan
+  // matchningen mot CSV-rader var tillräckligt robust) varje gång appen laddas, så befintlig felaktig
+  // data rättas till utan att man behöver importera om något.
+  try { await healAllOrphanAvrakningsnotaTrades(); } catch (err) { console.error('Kunde inte läka spöktrades', err); }
   renderOverview();
 });
