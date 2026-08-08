@@ -327,6 +327,253 @@ function parseAvanzaCSV(text) {
   return rows;
 }
 
+/* ---------- Avräkningsnota (PDF) import ----------
+ * Avanzas avräkningsnota är ett PDF-formulär – en sida per handlad transaktion. Siffrorna (datum,
+ * antal, kurs, klockslag osv) ligger som IFYLLDA FORMULÄRFÄLT, inte som vanlig text i sidan (vanlig
+ * textextraktion ger bara etiketterna som "Antal"/"Kurs", aldrig värdena). Fältnamnen är stabila
+ * mellan notor (verifierat mot 11 riktiga notor): business_date, instrument_headline (innehåller
+ * "köpt"/"sålt"), instrument_name, isin_number, misc_1_value (totalt antal), misc_2_value
+ * (volymviktad snittkurs), instrument_5_1_value ("YYMMDD HH:MM:SS", klockslaget CSV-exporten saknar),
+ * sum_1_value (köpeskilling/likvid), sum_2_value (courtage). CSV-exporten har Resultat men inget
+ * klockslag; avräkningsnotan har klockslag men inget Resultat – detta är precis varför de kompletterar
+ * varandra istället för att ersätta varandra. */
+
+/* Parsar EN sidas redan uttagna formulärfält (namn -> strängvärde) till en notatransaktion, eller
+ * null om sidan inte såg ut som en avräkningsnota (t.ex. saknade fält). Ren funktion – ingen PDF/DOM
+ * inblandad – så den kan testas direkt med hopplockade fältvärden. */
+function parseAvrakningsnotaPage(fields) {
+  if (!fields) return null;
+  const headline = fields.instrument_headline || '';
+  let type = null;
+  if (/köpt/i.test(headline)) type = 'Köp';
+  else if (/sålt/i.test(headline)) type = 'Sälj';
+  const date = (fields.business_date || '').trim();
+  const instrument = (fields.instrument_name || '').trim();
+  if (!type || !date || !instrument) return null;
+
+  // En order kan i sällsynta fall ha fyllts i flera delklipp (instrument_1_1_value,
+  // instrument_1_2_value, ...) inom samma nota, var och en med eget klockslag.
+  const legs = [];
+  for (let i = 1; i <= 10; i++) {
+    const qtyRaw = fields['instrument_1_' + i + '_value'];
+    if (qtyRaw === undefined) break;
+    const qty = parseSwedishNumber(qtyRaw);
+    if (qty === null) continue;
+    const price = parseSwedishNumber(fields['instrument_3_' + i + '_value']);
+    const timeMatch = /(\d{2}):(\d{2}):(\d{2})/.exec(fields['instrument_5_' + i + '_value'] || '');
+    legs.push({ qty, price, time: timeMatch ? timeMatch[0] : null });
+  }
+  if (legs.length === 0) return null;
+
+  const totalQtyField = parseSwedishNumber(fields.misc_1_value);
+  const totalQty = totalQtyField !== null ? totalQtyField : legs.reduce((s, l) => s + l.qty, 0);
+  const avgPriceField = parseSwedishNumber(fields.misc_2_value);
+  const price = avgPriceField !== null ? avgPriceField : legs[0].price;
+  const totalAmountAbs = parseSwedishNumber(fields.sum_1_value);
+  const commission = parseSwedishNumber(fields.sum_2_value) || 0;
+  const currency = (fields.instrument_4_1_value || 'SEK').trim();
+  const isin = (fields.isin_number || '').trim();
+  const noteNumber = (fields.number || '').trim();
+  // Tidigaste ifyllda klockslaget bland delklippen = när ordern började exekveras.
+  const time = legs.map(l => l.time).find(t => !!t) || null;
+
+  return {
+    noteNumber, date, type, instrument, isin,
+    quantity: type === 'Sälj' ? -Math.abs(totalQty) : Math.abs(totalQty),
+    price,
+    amount: totalAmountAbs === null ? null : (type === 'Köp' ? -Math.abs(totalAmountAbs) : Math.abs(totalAmountAbs)),
+    commission, currency, time,
+  };
+}
+
+/* Parsar alla sidor i en avräkningsnota-PDF (en eller flera notor i samma fil). */
+function parseAvrakningsnotaFields(pagesFields) {
+  const notes = [];
+  let unparsed = 0;
+  (pagesFields || []).forEach(fields => {
+    const note = parseAvrakningsnotaPage(fields);
+    if (note) notes.push(note); else unparsed++;
+  });
+  return { notes, unparsed };
+}
+
+/* Matchar avräkningsnotor mot redan importerade CSV-trades (samma datum, ISIN/instrument, typ, antal
+ * och pris) för att sätta ett exakt klockslag på transaktionen. Om ingen matchning finns skapas
+ * istället en helt ny trade-rad direkt från notan (utan Resultat, eftersom notor inte innehåller
+ * realiserad vinst/förlust). Ren funktion – inga DB-anrop – så matchningslogiken går att testa
+ * isolerat mot riktiga notor + riktiga CSV-rader. */
+function matchAvrakningsnotorToTrades(notes, existingTrades) {
+  const byDate = {};
+  existingTrades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
+  const claimed = new Set();
+  const matches = [];        // { note, trade } – trade får sitt klockslag satt
+  const alreadyTimed = [];   // notan matchade en trade som redan hade ett klockslag (dubbelimport)
+  const newTradeRows = [];   // ingen matchning hittades -> blir en egen ny trade-rad
+
+  notes.forEach(note => {
+    const candidates = (byDate[note.date] || []).filter(t => {
+      if (claimed.has(t.id)) return false;
+      if (t.type !== note.type) return false;
+      const sameIsin = !!(note.isin && t.isin && note.isin === t.isin);
+      const sameName = (t.instrument || '').trim() === note.instrument;
+      if (!sameIsin && !sameName) return false;
+      if (Math.abs(Math.abs(t.quantity) - Math.abs(note.quantity)) > 0.001) return false;
+      if (t.price !== null && t.price !== undefined && note.price !== null && Math.abs(t.price - note.price) > 0.01) return false;
+      return true;
+    });
+    const match = candidates[0];
+    if (match) {
+      claimed.add(match.id);
+      if (match.time) alreadyTimed.push(note); else matches.push({ note, trade: match });
+    } else {
+      newTradeRows.push(note);
+    }
+  });
+
+  return { matches, newTradeRows, alreadyTimed };
+}
+
+/* Utför matchningen mot databasen: sätter klockslag på befintliga trades, skapar nya trade-rader för
+ * omatchade notor, och skriver om fileOrder till den RIKTIGA kronologiska ordningen för varje dag där
+ * samtliga trades nu har ett klockslag (istället för CSV-radordningens gissning). */
+async function applyAvrakningsnotaImport(notes, filename) {
+  if (notes.length === 0) return { filename, matched: 0, inserted: 0, skipped: 0, unparsed: 0 };
+  const dates = Array.from(new Set(notes.map(n => n.date))).sort();
+  let existing = [];
+  for (const d of dates) existing = existing.concat(await dbGetAllByIndex('trades', 'date', d));
+
+  const { matches, newTradeRows, alreadyTimed } = matchAvrakningsnotorToTrades(notes, existing);
+
+  for (const { note, trade } of matches) {
+    await dbPut('trades', Object.assign({}, trade, { time: note.time, noteNumber: note.noteNumber }));
+  }
+
+  const insertedIds = [];
+  for (const note of newTradeRows) {
+    const signature = ['avrakningsnota', note.date, note.type, note.instrument, note.quantity, note.price, note.noteNumber].join('|');
+    const row = {
+      date: note.date, type: note.type, instrument: note.instrument, isin: note.isin,
+      quantity: note.quantity, price: note.price, amount: note.amount, currency: note.currency,
+      commission: note.commission, result: null, time: note.time, source: 'avrakningsnota',
+      noteNumber: note.noteNumber, signature, fileOrder: 0,
+    };
+    insertedIds.push(await dbAdd('trades', row));
+  }
+
+  for (const d of dates) {
+    const dayTrades = await dbGetAllByIndex('trades', 'date', d);
+    if (dayTrades.length > 0 && dayTrades.every(t => t.time)) {
+      const sorted = dayTrades.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+      for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i].fileOrder !== i) await dbPut('trades', Object.assign({}, sorted[i], { fileOrder: i }));
+      }
+    }
+  }
+
+  if (insertedIds.length > 0) {
+    await dbAdd('importBatches', {
+      filename, importedAt: new Date().toISOString(),
+      inserted: insertedIds.length, skipped: alreadyTimed.length, totalRows: notes.length,
+      excludedCount: 0, excludedSummary: [],
+      dateFrom: dates[0], dateTo: dates[dates.length - 1],
+      tradeIds: insertedIds, sourceType: 'pdf',
+    });
+  }
+
+  return { filename, matched: matches.length, inserted: insertedIds.length, skipped: alreadyTimed.length, unparsed: 0 };
+}
+
+let pdfjsLoadPromise = null;
+function ensurePdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (pdfjsLoadPromise) return pdfjsLoadPromise;
+  pdfjsLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    script.onload = () => {
+      try {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        resolve(window.pdfjsLib);
+      } catch (err) { reject(err); }
+    };
+    script.onerror = () => reject(new Error('Kunde inte ladda PDF-läsaren.'));
+    document.head.appendChild(script);
+  });
+  return pdfjsLoadPromise;
+}
+
+/* Läser ut formulärfälten sida för sida ur en riktig PDF-fil (browser-delen – kräver pdf.js). */
+async function extractPdfFormFieldsPerPage(file) {
+  const pdfjsLib = await ensurePdfJs();
+  const buf = await file.arrayBuffer();
+  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+  const pages = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const annots = await page.getAnnotations({ intent: 'display' });
+    const fields = {};
+    annots.forEach(a => { if (a.fieldName && a.fieldValue !== undefined) fields[a.fieldName] = a.fieldValue; });
+    pages.push(fields);
+  }
+  return pages;
+}
+
+function renderPDFImportResultsSummary(results) {
+  const resultEl = document.getElementById('importResult');
+  if (!resultEl) return;
+  const html = results.map(r => {
+    if (r.error) return `<p class="value neg" style="margin-top:8px;">${escapeHtml(r.filename)}: ${escapeHtml(r.error)}</p>`;
+    const parts = [];
+    if (r.matched) parts.push(`${r.matched} transaktion${r.matched === 1 ? '' : 'er'} fick exakt klockslag`);
+    if (r.inserted) parts.push(`${r.inserted} ny${r.inserted === 1 ? '' : 'a'} trade${r.inserted === 1 ? '' : 's'} skapade direkt från notan`);
+    if (r.skipped) parts.push(`${r.skipped} redan tidsatta sedan tidigare (dubbelimport)`);
+    if (r.unparsed) parts.push(`${r.unparsed} sid${r.unparsed === 1 ? 'a' : 'or'} kunde inte tolkas`);
+    return `<p class="value pos" style="margin-top:8px;">${escapeHtml(r.filename)} (avräkningsnota): ${parts.join(', ') || 'inget att göra'}.</p>`;
+  }).join('');
+  resultEl.innerHTML += html;
+}
+
+async function handlePDFImportFiles(fileList) {
+  const files = Array.from(fileList || []).filter(f => f);
+  if (files.length === 0) return [];
+  const results = [];
+  for (const file of files) {
+    try {
+      const pagesFields = await extractPdfFormFieldsPerPage(file);
+      const { notes, unparsed } = parseAvrakningsnotaFields(pagesFields);
+      if (notes.length === 0) {
+        results.push({ filename: file.name, error: 'Kände inte igen någon avräkningsnota i filen.' });
+        continue;
+      }
+      const r = await applyAvrakningsnotaImport(notes, file.name);
+      r.unparsed = unparsed;
+      results.push(r);
+    } catch (err) {
+      results.push({ filename: file.name, error: err.message || 'Kunde inte läsa PDF-filen.' });
+    }
+  }
+  renderPDFImportResultsSummary(results);
+  await renderImportHistory();
+  await renderOverview();
+  return results;
+}
+
+/* Delar upp en filsläpp/filval i CSV- respektive PDF-filer och kör rätt importflöde för varje – så att
+ * man kan släppa både transaktions-CSV:n och dagens avräkningsnotor i samma drag. */
+async function handleMixedImportFiles(fileList) {
+  const files = Array.from(fileList || []).filter(f => f);
+  if (files.length === 0) return;
+  const csvFiles = files.filter(f => /\.csv$/i.test(f.name));
+  const pdfFiles = files.filter(f => /\.pdf$/i.test(f.name));
+  const resultEl = document.getElementById('importResult');
+  if (resultEl) resultEl.innerHTML = '';
+  if (csvFiles.length) await handleCSVImportFiles(csvFiles);
+  if (pdfFiles.length) await handlePDFImportFiles(pdfFiles);
+  if (!csvFiles.length && !pdfFiles.length) {
+    if (resultEl) resultEl.innerHTML = '<p class="value neg">Filtypen kändes inte igen – välj en Avanza-CSV eller en avräkningsnota (PDF).</p>';
+  }
+}
+
 /* Endast köp/sälj av BULL/BEAR-certifikat på guld ska räknas som trades i journalen. */
 const GOLD_BULLBEAR_REGEX = /^(BULL|BEAR)\s+GULD\b/i;
 function isBuySellType(type) { return type === 'Köp' || type === 'Sälj'; }
@@ -478,8 +725,8 @@ async function handleCSVImportFiles(fileList) {
   }
 
   renderImportResultsSummary(results);
-  renderImportHistory();
-  renderOverview();
+  await renderImportHistory();
+  await renderOverview();
 }
 
 async function handleCSVImport(file) {
@@ -697,7 +944,7 @@ function setupImport() {
   const fileInput = document.getElementById('csvFile');
   dropzone.addEventListener('click', () => fileInput.click());
   fileInput.addEventListener('change', (e) => {
-    if (e.target.files && e.target.files.length) handleCSVImportFiles(e.target.files);
+    if (e.target.files && e.target.files.length) handleMixedImportFiles(e.target.files);
     e.target.value = '';
   });
   dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
@@ -706,7 +953,7 @@ function setupImport() {
     e.preventDefault();
     dropzone.classList.remove('dragover');
     const files = e.dataTransfer.files;
-    if (files && files.length) handleCSVImportFiles(files);
+    if (files && files.length) handleMixedImportFiles(files);
   });
   const sortSelect = document.getElementById('importSort');
   if (sortSelect) sortSelect.addEventListener('change', renderImportHistory);
@@ -1991,7 +2238,7 @@ async function renderHeatmap() {
         // CSV direkt utan att behöva byta till fliken "Importera" – vilka datum som faktiskt landar
         // i databasen styrs fortfarande av filens eget innehåll, inte av vilken ruta man klickade på.
         cls += ' heatmap-cell-empty';
-        pnlLabel = '<div class="dpnl-add" title="Importera CSV för denna period">+</div>';
+        pnlLabel = '<div class="dpnl-add" title="Importera CSV eller avräkningsnota (PDF) för denna period">+</div>';
       }
       rowHtml += `<div class="${cls}" data-date="${dateStr}"><div class="dnum">${day}</div>${pnlLabel}</div>`;
     }
@@ -2018,14 +2265,14 @@ async function renderHeatmap() {
 // vanlig import tar), och en toast bekräftar när den är klar.
 function openQuickImportModal() {
   openModal(`
-    <h3>Importera CSV</h3>
-    <p class="muted small" style="margin-bottom:14px;">Snabbimport direkt från kalendern. Vilka datum som importeras avgörs av filens eget innehåll, inte av vilken ruta du klickade på.</p>
+    <h3>Importera CSV eller avräkningsnota</h3>
+    <p class="muted small" style="margin-bottom:14px;">Snabbimport direkt från kalendern. Släpp en Avanza-CSV, en eller flera avräkningsnota-PDF:er, eller båda samtidigt – avräkningsnotan ger transaktionerna ett exakt klockslag som CSV-filen saknar. Vilka datum som importeras avgörs av filernas eget innehåll, inte av vilken ruta du klickade på.</p>
     <div class="dropzone" id="quickImportDropzone">
-      <input type="file" id="quickImportFile" accept=".csv" multiple hidden>
+      <input type="file" id="quickImportFile" accept=".csv,.pdf" multiple hidden>
       <div class="dropzone-inner">
         <div class="dropzone-icon">⇪</div>
-        <p><strong>Klicka för att välja filer</strong> eller dra och släpp CSV-filer här</p>
-        <p class="muted small">Du kan välja/släppa flera filer samtidigt.</p>
+        <p><strong>Klicka för att välja filer</strong> eller dra och släpp CSV/PDF-filer här</p>
+        <p class="muted small">Du kan välja/släppa flera filer samtidigt, av båda typerna.</p>
       </div>
     </div>
     <div class="modal-actions" style="margin-top:16px;">
@@ -2037,7 +2284,7 @@ function openQuickImportModal() {
   const runImport = async (files) => {
     if (!files || !files.length) return;
     closeModal();
-    await handleCSVImportFiles(files);
+    await handleMixedImportFiles(files);
     showToast('Import klar – se Översikt för resultatet');
   };
   dz.addEventListener('click', () => input.click());
