@@ -135,12 +135,12 @@ function runStatAnimations(container) {
   });
 }
 let toastTimer = null;
-function showToast(msg) {
+function showToast(msg, durationMs) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+  toastTimer = setTimeout(() => el.classList.remove('show'), durationMs || 2400);
 }
 
 /* ---------- Modal / Lightbox ---------- */
@@ -555,11 +555,21 @@ async function healAllOrphanAvrakningsnotaTrades() {
   return healOrphanAvrakningsnotaTrades(orphanDates);
 }
 
+/* Kastar ett tydligt fel om ett löfte inte gör NÅGOT (varken lyckas eller misslyckas) inom given tid –
+ * utan detta kan ett blockerat CDN-anrop eller en Worker som aldrig startar göra att importen bara
+ * "hänger" med en snurrande PDF-fil och inget syns i importrutan, istället för ett felmeddelande. */
+function withTimeout(promise, ms, message) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(v => { clearTimeout(timer); resolve(v); }, err => { clearTimeout(timer); reject(err); });
+  });
+}
+
 let pdfjsLoadPromise = null;
 function ensurePdfJs() {
   if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
   if (pdfjsLoadPromise) return pdfjsLoadPromise;
-  pdfjsLoadPromise = new Promise((resolve, reject) => {
+  pdfjsLoadPromise = withTimeout(new Promise((resolve, reject) => {
     const script = document.createElement('script');
     script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
     script.onload = () => {
@@ -568,17 +578,27 @@ function ensurePdfJs() {
         resolve(window.pdfjsLib);
       } catch (err) { reject(err); }
     };
-    script.onerror = () => reject(new Error('Kunde inte ladda PDF-läsaren.'));
+    script.onerror = () => reject(new Error('Kunde inte ladda PDF-läsaren (nätverket blockerade troligen cdnjs.cloudflare.com).'));
     document.head.appendChild(script);
+  }), 15000, 'Det tog för lång tid att ladda PDF-läsaren (>15s) – kontrollera nätverksanslutningen eller att inget blockerar cdnjs.cloudflare.com.').catch(err => {
+    pdfjsLoadPromise = null; // tillåt ett nytt försök nästa gång istället för att fastna på ett trasigt löfte för alltid
+    throw err;
   });
   return pdfjsLoadPromise;
 }
 
-/* Läser ut formulärfälten sida för sida ur en riktig PDF-fil (browser-delen – kräver pdf.js). */
+/* Läser ut formulärfälten sida för sida ur en riktig PDF-fil (browser-delen – kräver pdf.js).
+ * disableWorker: true körs medvetet – dessa filer är små (några sidor formulärdata, ingen rendering),
+ * och att slippa skapa en separat Web Worker från ett annat ursprung (cdnjs) tar bort en hel klass av
+ * tysta fel som annars kan uppstå om webbläsaren/nätverket stryper korsdomän-workers. */
 async function extractPdfFormFieldsPerPage(file) {
   const pdfjsLib = await ensurePdfJs();
   const buf = await file.arrayBuffer();
-  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+  const doc = await withTimeout(
+    pdfjsLib.getDocument({ data: buf, disableWorker: true }).promise,
+    15000,
+    'Det tog för lång tid att läsa PDF-filen (>15s).'
+  );
   const pages = [];
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
@@ -593,6 +613,8 @@ async function extractPdfFormFieldsPerPage(file) {
 function renderPDFImportResultsSummary(results) {
   const resultEl = document.getElementById('importResult');
   if (!resultEl) return;
+  const loadingEl = document.getElementById('pdfImportLoading');
+  if (loadingEl) loadingEl.remove();
   const html = results.map(r => {
     if (r.error) return `<p class="value neg" style="margin-top:8px;">${escapeHtml(r.filename)}: ${escapeHtml(r.error)}</p>`;
     const parts = [];
@@ -608,6 +630,11 @@ function renderPDFImportResultsSummary(results) {
 async function handlePDFImportFiles(fileList) {
   const files = Array.from(fileList || []).filter(f => f);
   if (files.length === 0) return [];
+  // Visas direkt (innan pdf.js ens hunnit ladda) så att man ser att något faktiskt händer – annars kan
+  // en blockerad CDN-nedladdning eller en fastnad Worker göra att importrutan bara ser ut att stå still
+  // med filen "laddad" utan någon synlig reaktion alls, vilket är precis vad som rapporterades.
+  const resultEl = document.getElementById('importResult');
+  if (resultEl) resultEl.innerHTML += `<p class="muted" id="pdfImportLoading">Läser ${files.length > 1 ? files.length + ' avräkningsnota-PDF:er' : 'avräkningsnota-PDF:en ' + escapeHtml(files[0].name)}...</p>`;
   const results = [];
   for (const file of files) {
     try {
@@ -634,16 +661,18 @@ async function handlePDFImportFiles(fileList) {
  * man kan släppa både transaktions-CSV:n och dagens avräkningsnotor i samma drag. */
 async function handleMixedImportFiles(fileList) {
   const files = Array.from(fileList || []).filter(f => f);
-  if (files.length === 0) return;
+  if (files.length === 0) return { csvResults: [], pdfResults: [] };
   const csvFiles = files.filter(f => /\.csv$/i.test(f.name));
   const pdfFiles = files.filter(f => /\.pdf$/i.test(f.name));
   const resultEl = document.getElementById('importResult');
   if (resultEl) resultEl.innerHTML = '';
-  if (csvFiles.length) await handleCSVImportFiles(csvFiles);
-  if (pdfFiles.length) await handlePDFImportFiles(pdfFiles);
+  let csvResults = [], pdfResults = [];
+  if (csvFiles.length) csvResults = (await handleCSVImportFiles(csvFiles)) || [];
+  if (pdfFiles.length) pdfResults = (await handlePDFImportFiles(pdfFiles)) || [];
   if (!csvFiles.length && !pdfFiles.length) {
     if (resultEl) resultEl.innerHTML = '<p class="value neg">Filtypen kändes inte igen – välj en Avanza-CSV eller en avräkningsnota (PDF).</p>';
   }
+  return { csvResults, pdfResults };
 }
 
 /* Endast köp/sälj av BULL/BEAR-certifikat på guld ska räknas som trades i journalen. */
@@ -803,6 +832,7 @@ async function handleCSVImportFiles(fileList) {
   renderImportResultsSummary(results);
   await renderImportHistory();
   await renderOverview();
+  return results;
 }
 
 async function handleCSVImport(file) {
@@ -2360,8 +2390,19 @@ function openQuickImportModal() {
   const runImport = async (files) => {
     if (!files || !files.length) return;
     closeModal();
-    await handleMixedImportFiles(files);
-    showToast('Import klar – se Översikt för resultatet');
+    // Läser rutan i #importResult (fliken Importera) uppdateras alltid, men den fliken syns inte just
+    // nu (vi är kvar på Översikt) – utan en toast som faktiskt speglar vad som hände skulle ett
+    // misslyckat/hängande PDF-inläsning se ut som att "ingenting händer" här, vilket rapporterades.
+    const { csvResults, pdfResults } = await handleMixedImportFiles(files);
+    const all = (csvResults || []).concat(pdfResults || []);
+    const errors = all.filter(r => r.error);
+    if (errors.length > 0) {
+      showToast('Import misslyckades: ' + errors[0].error, 6000);
+    } else if (all.length > 0) {
+      showToast('Import klar – se Översikt för resultatet');
+    } else {
+      showToast('Inget importerades.');
+    }
   };
   dz.addEventListener('click', () => input.click());
   input.addEventListener('change', (e) => { runImport(e.target.files); e.target.value = ''; });
