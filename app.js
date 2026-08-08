@@ -2054,11 +2054,13 @@ function setupHeatmapNav() {
     heatmapCursor.setMonth(heatmapCursor.getMonth() - 1);
     renderHeatmap();
     renderGlobalStatsRow();
+    renderAchievements();
   });
   document.getElementById('heatmapNext').addEventListener('click', () => {
     heatmapCursor.setMonth(heatmapCursor.getMonth() + 1);
     renderHeatmap();
     renderGlobalStatsRow();
+    renderAchievements();
   });
   document.getElementById('heatmapMetricFinalBtn').addEventListener('click', () => {
     heatmapMetric = 'final';
@@ -2079,8 +2081,8 @@ function setupHeatmapNav() {
 }
 
 /* ---------- Gamification: streaks & badges ---------- */
-async function computeStreaks() {
-  const trades = await dbGetAll('trades');
+async function computeStreaks(trades) {
+  if (!trades) trades = await dbGetAll('trades');
   const byDate = {};
   trades.forEach(t => { (byDate[t.date] = byDate[t.date] || []).push(t); });
   const dates = Object.keys(byDate).sort();
@@ -2155,22 +2157,44 @@ function computeOverallPerformanceStats(allTrades) {
 }
 
 async function renderAchievements() {
-  const trades = await dbGetAll('trades');
-  const streaks = await computeStreaks();
+  const allTrades = await dbGetAll('trades');
 
   const banner = document.getElementById('streakBanner');
   const shelf = document.getElementById('badgeShelf');
-  if (trades.length === 0) {
+  const headerLabel = document.getElementById('statsMonthLabel');
+
+  if (allTrades.length === 0) {
+    if (headerLabel) headerLabel.textContent = '';
     banner.innerHTML = `<span class="muted">Importera trades för att börja bygga din statistik.</span>`;
     shelf.innerHTML = '';
     return;
   }
 
+  // Samma vald månad som kalendern nedan (heatmapCursor) styr – bläddrar du till juli visas
+  // juli-statistik här, inte hela historiken.
+  const cursorMonth = heatmapCursor || new Date();
+  const monthRange = getMonthRange(cursorMonth);
+  const trades = allTrades.filter(t => {
+    const d = new Date(t.date + 'T00:00:00');
+    return d >= monthRange.start && d <= monthRange.end;
+  });
+  const monthLabelText = cursorMonth.toLocaleDateString('sv-SE', { month: 'long', year: 'numeric' });
+  const monthLabel = monthLabelText.charAt(0).toUpperCase() + monthLabelText.slice(1);
+  if (headerLabel) headerLabel.textContent = monthLabel;
+
+  if (trades.length === 0) {
+    banner.innerHTML = `<span class="muted">Inga trades i ${monthLabel.toLowerCase()}.</span>`;
+    shelf.innerHTML = '';
+    return;
+  }
+
+  const streaks = await computeStreaks(trades);
+
   banner.innerHTML = `
     <span class="streak-icon"></span>
     <div class="streak-figure"><span class="num">${streaks.current}</span><span class="lbl">Nuvarande vinststreak</span></div>
     <div class="streak-figure"><span class="num">${streaks.best}</span><span class="lbl">Bästa streak</span></div>
-    <div class="streak-figure"><span class="num">${streaks.tradingDays}</span><span class="lbl">Handelsdagar totalt</span></div>
+    <div class="streak-figure"><span class="num">${streaks.tradingDays}</span><span class="lbl">Handelsdagar</span></div>
   `;
 
   const perf = computeOverallPerformanceStats(trades);
