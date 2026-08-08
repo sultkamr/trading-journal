@@ -443,9 +443,28 @@ function matchAvrakningsnotorToTrades(notes, existingTrades) {
   return { matches, newTradeRows, alreadyTimed };
 }
 
+/* Skriver om fileOrder för en dags trades så att de med exakt klockslag (från en matchad
+ * avräkningsnota) hamnar i rätt inbördes kronologisk ordning. Trades UTAN klockslag rör sig inte –
+ * de behåller sin tidigare (gissade CSV-radordnings-) plats, det finns inget bättre att gå på för
+ * dem. Körs oavsett om ALLA trades den dagen har klockslag eller bara några: tidigare krävdes att
+ * samtliga hade det (dayTrades.every(t => t.time)), vilket gjorde att en enda omatchad rad
+ * blockerade omsorteringen för HELA dagen – det var precis vad som gav fel ordning trots att flera
+ * trades faktiskt hade exakta klockslag från PDF:en. */
+async function reorderDayByTime(dayTrades) {
+  const base = dayTrades.slice().sort((a, b) => a.fileOrder - b.fileOrder);
+  const timedSlots = [];
+  base.forEach((t, i) => { if (t.time) timedSlots.push(i); });
+  if (timedSlots.length > 1) {
+    const timedSorted = timedSlots.map(i => base[i]).sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
+    timedSlots.forEach((slot, k) => { base[slot] = timedSorted[k]; });
+  }
+  for (let i = 0; i < base.length; i++) {
+    if (base[i].fileOrder !== i) await dbPut('trades', Object.assign({}, base[i], { fileOrder: i }));
+  }
+}
+
 /* Utför matchningen mot databasen: sätter klockslag på befintliga trades, skapar nya trade-rader för
- * omatchade notor, och skriver om fileOrder till den RIKTIGA kronologiska ordningen för varje dag där
- * samtliga trades nu har ett klockslag (istället för CSV-radordningens gissning). */
+ * omatchade notor, och skriver om fileOrder efter varje dags klockslag (se reorderDayByTime ovan). */
 async function applyAvrakningsnotaImport(notes, filename) {
   if (notes.length === 0) return { filename, matched: 0, inserted: 0, skipped: 0, unparsed: 0 };
   const dates = Array.from(new Set(notes.map(n => n.date))).sort();
@@ -475,12 +494,7 @@ async function applyAvrakningsnotaImport(notes, filename) {
 
   for (const d of dates) {
     const dayTrades = await dbGetAllByIndex('trades', 'date', d);
-    if (dayTrades.length > 0 && dayTrades.every(t => t.time)) {
-      const sorted = dayTrades.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
-      for (let i = 0; i < sorted.length; i++) {
-        if (sorted[i].fileOrder !== i) await dbPut('trades', Object.assign({}, sorted[i], { fileOrder: i }));
-      }
-    }
+    await reorderDayByTime(dayTrades);
   }
 
   if (insertedIds.length > 0) {
@@ -535,12 +549,7 @@ async function healOrphanAvrakningsnotaTrades(dates) {
       }
     }
     const refreshed = await dbGetAllByIndex('trades', 'date', d);
-    if (refreshed.length > 0 && refreshed.every(t => t.time)) {
-      const sorted = refreshed.slice().sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0));
-      for (let i = 0; i < sorted.length; i++) {
-        if (sorted[i].fileOrder !== i) await dbPut('trades', Object.assign({}, sorted[i], { fileOrder: i }));
-      }
-    }
+    await reorderDayByTime(refreshed);
   }
   return healedCount;
 }
@@ -1283,10 +1292,14 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) 
         <td>${escapeHtml(g.exitLabels[i])}</td>
         <td>${formatNum(Math.abs(t.quantity), 0)}</td>
         <td>${formatNum(t.price, 4)}</td>
+        <td>${t.time ? escapeHtml(t.time) : '<span class="muted">–</span>'}</td>
         <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
       </tr>
     `).join('');
     const lastLeg = g.legs[g.legs.length - 1];
+    // Tidigaste ifyllda klockslaget bland entry-benen (från en matchad avräkningsnota) – visas i
+    // metaraden så man ser när positionen faktiskt öppnades, inte bara vad den kostade.
+    const entryTime = g.entryLegs.map(t => t.time).find(Boolean);
 
     // Resultat/risk per position i % av köpt belopp – visas alltid (vinst eller förlust), inte bara
     // när risken sprack. Vid förlust jämförs den mot riskbudgeten (~2,4% × hävstång) och flaggas om
@@ -1337,7 +1350,7 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) 
         <div>
           <div class="entry-card-title">Trade ${gi + 1}: ${escapeHtml(g.instrument)} <span class="pill ${statusClass}" style="margin-left:8px;">${escapeHtml(statusLabel)}</span></div>
           <div class="entry-card-meta">
-            ${g.entryQty > 0 ? `Entry: ${formatNum(g.entryQty, 0)} st @ snitt ${formatNum(g.avgEntryPrice, 4)} (${formatMoney(-g.entryCost)})` : 'Entry: okänd (positionen fanns redan innan denna dag)'}
+            ${g.entryQty > 0 ? `Entry: ${formatNum(g.entryQty, 0)} st @ snitt ${formatNum(g.avgEntryPrice, 4)} (${formatMoney(-g.entryCost)})${entryTime ? ` kl. ${escapeHtml(entryTime)}` : ''}` : 'Entry: okänd (positionen fanns redan innan denna dag)'}
             ${g.exitQty > 0 ? ` · Stängt: ${formatNum(g.exitQty, 0)} st i ${g.exitLegs.length} del${g.exitLegs.length > 1 ? 'ar' : ''}` : ' · Fortfarande öppen'}
           </div>
           ${riskHtml}
@@ -1346,7 +1359,7 @@ function renderTradeGroups(groups, baseMovePct, tolerancePct, journalByTradeId) 
       </div>
       ${g.exitLegs.length ? `
       <table class="trade-table" style="margin-top:10px;">
-        <thead><tr><th>Del</th><th>Antal</th><th>Kurs</th><th>Resultat</th></tr></thead>
+        <thead><tr><th>Del</th><th>Antal</th><th>Kurs</th><th>Tid</th><th>Resultat</th></tr></thead>
         <tbody>${exitRows}</tbody>
       </table>` : ''}
       ${imagesHtml}
@@ -1441,6 +1454,7 @@ function renderCompactTradeTable(stats) {
       <td>${escapeHtml(t.instrument)}</td>
       <td>${formatNum(t.quantity, 0)}</td>
       <td>${formatNum(t.price, 4)}</td>
+      <td>${t.time ? escapeHtml(t.time) : '<span class="muted">–</span>'}</td>
       <td>${t.amount != null ? formatMoney(t.amount) : ''}</td>
       <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
       <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeak ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;"><span class="status-dot ok" style="margin-right:5px;"></span>Hit borde du stannat</span>' : ''}</td>
@@ -1448,7 +1462,7 @@ function renderCompactTradeTable(stats) {
   }).join('');
   return `
     <table class="trade-table" style="margin-top:14px;">
-      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Antal</th><th>Kurs</th><th>Belopp</th><th>Resultat</th><th>Löpande</th></tr></thead>
+      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Antal</th><th>Kurs</th><th>Tid</th><th>Belopp</th><th>Resultat</th><th>Löpande</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <p class="muted small" style="margin-top:8px; line-height:1.5;">Flera "Köp"-rader på samma certifikat är normalt inte dubbletter – de visar att positionen byggdes upp i flera steg (ofta till olika kurs/antal, se kolumnerna Antal/Kurs/Belopp). Köp-rader saknar alltid Resultat eftersom vinst/förlust bara uppstår vid Sälj. För dagens första transaktion är Resultat och Löpande alltid samma summa, eftersom det löpande resultatet bara är den enda tradens resultat så länge inget annat hänt än dagen.</p>
@@ -1482,7 +1496,7 @@ async function openDayInfoModal(date) {
     <p class="muted small" style="line-height:1.5;">${statusDotHtml(insight.tone)}${escapeHtml(insight.text)}</p>
     <div style="max-height: 420px; overflow-y: auto;">
       ${groups.length > 0 ? `
-        <p class="muted small" style="margin-bottom:6px;">Dagens trades, ihopparade (entry + ev. TP1/TP2/TP3... vid delvisa uttag). Klicka "+ Bild/anteckning" på ett tradekort för att koppla en skärmdump till just den traden. Avanzas export har inget klockslag, bara datum och radordning.</p>
+        <p class="muted small" style="margin-bottom:6px;">Dagens trades, ihopparade (entry + ev. TP1/TP2/TP3... vid delvisa uttag). Klicka "+ Bild/anteckning" på ett tradekort för att koppla en skärmdump till just den traden. Avanzas CSV-export saknar klockslag – importera avräkningsnotor (PDF) för exakt tid, annars visas "–" och ordningen är en gissning utifrån radordningen.</p>
         <div class="entry-list">${renderTradeGroups(groups, baseMovePct, riskTolerancePct, journalByTradeId)}</div>
       ` : ''}
       ${stats.tradeCount > 0 ? `<p class="muted small" style="margin:16px 0 0;">Alla transaktioner denna dag, rå ordning:</p>${renderCompactTradeTable(stats)}` : ''}
@@ -1593,6 +1607,7 @@ async function openDayDetail(date, reversed, viewMode) {
       <td>${escapeHtml(t.instrument)}</td>
       <td>${formatNum(t.quantity, 0)}</td>
       <td>${formatNum(t.price, 4)}</td>
+      <td>${t.time ? escapeHtml(t.time) : '<span class="muted">–</span>'}</td>
       <td>${t.amount != null ? formatMoney(t.amount) : ''}</td>
       <td class="${t.result > 0 ? 'num-pos' : t.result < 0 ? 'num-neg' : ''}">${t.result != null ? formatMoney(t.result) : '–'}</td>
       <td class="${t._running >= 0 ? 'num-pos' : 'num-neg'}">${formatMoney(t._running)}${isPeakRow ? ' <span class="rule-chip ok" style="margin-left:4px;white-space:nowrap;"><span class="status-dot ok" style="margin-right:5px;"></span>Hit borde du stannat</span>' : ''}</td>
@@ -1611,7 +1626,7 @@ async function openDayDetail(date, reversed, viewMode) {
   const groups = computeTradeGroupsForDay(ascTrades);
   const flatTableHtml = `
     <table class="trade-table">
-      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Antal</th><th>Kurs</th><th>Belopp</th><th>Resultat</th><th>Löpande</th><th>Risk (faktisk/max)</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Typ</th><th>Värdepapper</th><th>Antal</th><th>Kurs</th><th>Tid</th><th>Belopp</th><th>Resultat</th><th>Löpande</th><th>Risk (faktisk/max)</th><th></th></tr></thead>
       <tbody>${tableRows}</tbody>
     </table>
   `;
@@ -1632,7 +1647,7 @@ async function openDayDetail(date, reversed, viewMode) {
     ${riskNoteHtml}
     ${complianceHtml}
     <div class="reorder-note">
-      <span>Ordningen bygger på radordningen i Avanza-filen (ingen klockslagsinformation finns i exporten).</span>
+      <span>Ordningen följer klockslag från importerade avräkningsnotor (PDF) där sådana finns; övriga rader visas i Avanza-filens radordning (ingen klockslagsinformation finns i CSV-exporten).</span>
       <button class="btn btn-ghost btn-small" id="reverseOrderBtn" ${viewMode === 'grouped' ? 'disabled style="opacity:0.4;"' : ''}>↕ Vänd ordning</button>
       <button class="btn btn-primary btn-small" id="journalForDayBtn" style="margin-top:0;">+ Journalanteckning för dagen</button>
     </div>
