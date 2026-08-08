@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Journal</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">Trading Journal</span>
+  </div>
+  <nav class="tabs" id="mainTabs">
+    <button class="tab-btn active" data-view="overview">Översikt</button>
+    <button class="tab-btn" data-view="import">Importera</button>
+    <button class="tab-btn" data-view="journal">Journal</button>
+    <button class="tab-btn" data-view="education">Utbildning</button>
+    <button class="tab-btn" data-view="goldbias">Guldbias</button>
+    <button class="tab-btn" data-view="rules">Regler</button>
+  </nav>
+</header>
+
+<main id="app">
+
+  <!-- OVERVIEW -->
+  <section class="view" id="view-overview">
+    <div class="view-header">
+      <h1>Översikt</h1>
+      <p class="muted">Alla importerade handelsdagar. Klicka på en dag för att se detaljer, trade-sekvens och resultatkurva.</p>
+    </div>
+    <div class="stat-row" id="globalStats"></div>
+
+    <div class="card streak-card" id="achievementsCard">
+      <div class="card-header">
+        <h2>Prestationer</h2>
+      </div>
+      <div id="streakBanner" class="streak-banner"></div>
+      <div id="badgeShelf" class="badge-shelf"></div>
+    </div>
+
+    <div class="card" id="heatmapCard">
+      <div class="card-header">
+        <h2>Kalender</h2>
+        <div class="heatmap-nav">
+          <button class="btn btn-ghost btn-small" id="heatmapPrev">‹</button>
+          <span id="heatmapMonthLabel" class="heatmap-month-label"></span>
+          <button class="btn btn-ghost btn-small" id="heatmapNext">›</button>
+        </div>
+      </div>
+      <div class="filter-row" style="margin-bottom:10px;">
+        <span class="muted small" style="align-self:center;">Visa i rutorna:</span>
+        <button class="btn btn-small btn-primary" id="heatmapMetricFinalBtn" style="margin-top:0;">Slutresultat</button>
+        <button class="btn btn-small btn-secondary" id="heatmapMetricPeakBtn" style="margin-top:0;">Dagens topp</button>
+      </div>
+      <div id="heatmapGrid" class="heatmap-grid"></div>
+      <div class="heatmap-legend">
+        <span>Förlust</span>
+        <span class="legend-swatch l4"></span><span class="legend-swatch l3"></span><span class="legend-swatch l2"></span><span class="legend-swatch l1"></span><span class="legend-swatch l0"></span><span class="legend-swatch w1"></span><span class="legend-swatch w2"></span><span class="legend-swatch w3"></span><span class="legend-swatch w4"></span>
+        <span>Vinst</span>
+      </div>
+      <p class="muted small" style="margin-top:10px;">Klicka på en dag för att se vad som hände, vad som hade kunnat gå bättre och om det var övertradning.</p>
+    </div>
+
+    <div class="card" id="dayListCard">
+      <div class="card-header">
+        <h2>Handelsdagar</h2>
+      </div>
+      <div id="dayList" class="day-list"></div>
+    </div>
+    <div class="card hidden" id="dayDetailCard">
+      <div class="card-header">
+        <h2 id="dayDetailTitle">Dag</h2>
+        <button class="btn btn-ghost" id="closeDayDetail">✕ Stäng</button>
+      </div>
+      <div id="dayDetailContent"></div>
+    </div>
+  </section>
+
+  <!-- IMPORT -->
+  <section class="view hidden" id="view-import">
+    <div class="view-header">
+      <h1>Importera från Avanza</h1>
+      <p class="muted">Exportera din transaktionshistorik som CSV från Avanza (Mina sidor → Transaktioner → Exportera) och ladda upp filen här.</p>
+    </div>
+    <div class="card">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="csvFile" accept=".csv" hidden>
+        <div class="dropzone-inner">
+          <div class="dropzone-icon">⇪</div>
+          <p><strong>Klicka för att välja fil</strong> eller dra och släpp din CSV här</p>
+          <p class="muted small">Format: Avanza transaktionsexport (.csv), semikolon-separerad</p>
+        </div>
+      </div>
+      <div id="importResult"></div>
+    </div>
+    <div class="card">
+      <div class="card-header">
+        <h2>Tidigare importer</h2>
+        <select id="importSort">
+          <option value="imported_desc">Senast importerad</option>
+          <option value="date_desc">Handelsdatum, senaste först</option>
+          <option value="date_asc">Handelsdatum, äldsta först</option>
+        </select>
+      </div>
+      <div id="importHistory"></div>
+    </div>
+  </section>
+
+  <!-- JOURNAL -->
+  <section class="view hidden" id="view-journal">
+    <div class="view-header">
+      <h1>Journal</h1>
+      <p class="muted">Skriv om dina trades, hur du tänkte, och ladda upp bilder från plattformen för att gå igenom dem i efterhand.</p>
+      <button class="btn btn-primary" id="newJournalBtn">+ Ny anteckning</button>
+    </div>
+    <div class="card">
+      <div class="filter-row">
+        <input type="text" id="journalSearch" placeholder="Sök i journalen...">
+        <select id="journalFilter">
+          <option value="">Alla utfall</option>
+          <option value="win">Vinst</option>
+          <option value="loss">Förlust</option>
+          <option value="neutral">Neutral</option>
+        </select>
+      </div>
+      <div id="journalList" class="entry-list"></div>
+    </div>
+  </section>
+
+  <!-- EDUCATION -->
+  <section class="view hidden" id="view-education">
+    <div class="view-header">
+      <h1>Utbildning</h1>
+      <p class="muted">Samla din strategi, regler och lärdomar på ett ställe. Lägg till text och bilder.</p>
+      <button class="btn btn-primary" id="newEducationBtn">+ Nytt material</button>
+    </div>
+    <div class="card">
+      <div class="filter-row">
+        <input type="text" id="educationSearch" placeholder="Sök i utbildningsmaterial...">
+        <select id="educationFilter">
+          <option value="">Alla kategorier</option>
+          <option value="Strategi">Strategi</option>
+          <option value="Riskhantering">Riskhantering</option>
+          <option value="Psykologi">Psykologi</option>
+          <option value="Teknisk analys">Teknisk analys</option>
+          <option value="Övrigt">Övrigt</option>
+        </select>
+      </div>
+      <div id="educationList" class="entry-list"></div>
+    </div>
+  </section>
+
+  <!-- GOLD BIAS -->
+  <section class="view hidden" id="view-goldbias">
+    <div class="view-header">
+      <h1>Dagens tradingbias – Guld</h1>
+      <p class="muted">Logga din bias för guldet varje dag och bygg upp en historik du kan gå tillbaka till.</p>
+      <button class="btn btn-primary" id="newBiasBtn">+ Ny bias</button>
+    </div>
+    <div class="stat-row" id="biasStats"></div>
+    <div class="card">
+      <div class="filter-row">
+        <select id="biasFilter">
+          <option value="">Alla riktningar</option>
+          <option value="Bullish">Bullish</option>
+          <option value="Bearish">Bearish</option>
+          <option value="Neutral">Neutral</option>
+        </select>
+      </div>
+      <div id="biasList" class="entry-list"></div>
+    </div>
+  </section>
+
+  <!-- RULES -->
+  <section class="view hidden" id="view-rules">
+    <div class="view-header">
+      <h1>Tradingregler</h1>
+      <p class="muted">Sätt dina egna riskregler. Varje handelsdag stäms av mot reglerna och du ser direkt om du höll disciplinen.</p>
+      <button class="btn btn-primary" id="newRuleBtn">+ Ny regel</button>
+    </div>
+    <div class="stat-row" id="ruleStats"></div>
+    <div class="card">
+      <div class="card-header"><h2>Dina regler</h2></div>
+      <div id="rulesList" class="entry-list"></div>
+    </div>
+  </section>
+
+</main>
+
+<!-- MODAL -->
+<div class="modal-backdrop hidden" id="modalBackdrop">
+  <div class="modal" id="modal"></div>
+</div>
+
+<!-- LIGHTBOX -->
+<div class="lightbox hidden" id="lightbox">
+  <img id="lightboxImg" src="" alt="">
+  <button id="lightboxClose">✕</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
